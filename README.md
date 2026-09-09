@@ -1,5 +1,48 @@
 # NC-TK17-Liquids
 
+## Native decal freeze (0.8.8, pending gameplay verification)
+
+The 0.8.7 gameplay retest still showed animated decals. Its diagnostic log
+confirmed only 19 frozen controls: many custom picks returned a native hit
+(`result=9 count=1`, also `result=0 count=1`), failed the stricter particle
+attachment check, and immediately entered TK17's stain creation path anyway.
+The freeze capture incorrectly depended on that attachment check succeeding.
+
+0.8.8 captures successful custom native picks independently of particle
+attachment. The native routine at EXE+0x1f24ae skips creation for negative
+results; nonnegative hits now enroll the resulting new controls for freezing.
+The exact body-contact checks and existing contact retry policy are retained.
+Diagnostics now report `native_hit`, `body_confirmed`, and `retried` separately.
+The regression test replays the logged success/rejected-attachment combination:
+it fails with the old capture gate and passes with the corrected gate. Negative
+native results remain excluded even when result storage contains an old hit.
+The room/body ownership regression also passes.
+
+`[liquid_collision] native_decal_drip = false` captures each successful
+custom pick's actual stain group during the native pick. Before 0.8.7, the
+snapshot used the emitter selected before the update: the first pick could
+discover its descriptor too late, another emitter could use a different group,
+and native expiration could change the control count before creation.
+
+Frozen controls use TK17's `BlendControl.Weight` setter at full weight.
+The old direct write to `control+0x10` skipped the setter's notifications to
+dependent animation evaluators. The setter is resolved through the same
+object dispatch as the native update, without requiring PhysX. Before later
+writes, the control must still belong to the live update's group and its weak
+reference must still resolve to the captured object. Ordinary native contacts
+are excluded; `true` allows native animation again.
+
+`native_decal_freeze_test.c` passes against the real installed SYS weight setter
+and simulated native updates covering descriptor discovery on first contact,
+multiple groups, expiration before creation, ordinary-contact isolation,
+configuration toggling, and stale controls. Build with the same MinGW flags as
+the DLL, replacing `-shared` with the test source/executable paths; run from the
+workspace root so the test can map `The Klub 17/Binaries/ThriXXX010278-SYS.dll`.
+Visual confirmation in game is still required: start a fresh session with
+`false`, create new liquid contacts, and check that their initial textures hold.
+Switching to `true` should allow the native drip animation again. The log emits
+`liquid native stain frozen ... mode=property-setter` for the first 24 captures.
+
 ## Native graphics import recovery (0.8.6, pending gameplay verification)
 
 PhysX repeats graphics import installation in `on_create`. This can replace

@@ -24,7 +24,7 @@
 #define THISCALL __thiscall
 #endif
 
-#define LIQUIDS_VERSION "0.8.8-native-pick-freeze"
+#define LIQUIDS_VERSION "0.8.7-native-decal-freeze"
 #define TK17_EXE_TIMESTAMP 0x56EF69A0u
 #define TK17_EXE_IMAGE_SIZE 0x00312000u
 #define TK17_EXE_CHECKSUM 0x00304A16u
@@ -10264,8 +10264,8 @@ static void liquid_native_capture_new_frozen_controls(
 }
 
 /* The native loop can remove expired controls before picking, and can create
-   stains for several descriptors in one update. Snapshot at the successful
-   custom PickRay, then finish before the next native pick (or on update return).
+   stains for several descriptors in one update. Snapshot at the confirmed
+   PickRay, then finish before the next native pick (or on update return).
    This also covers the very first pick that discovers an emitter descriptor. */
 static void liquid_native_finish_frozen_capture(void)
 {
@@ -10288,38 +10288,6 @@ static void liquid_native_begin_frozen_capture(void *descriptor)
     capture->descriptor = descriptor;
     capture->group = liquid_native_stain_group(capture->update, descriptor);
     capture->first_control = liquid_native_stain_control_count(capture->group);
-}
-
-/* Called only after submitting a custom liquid ray. Keep native decal
-   creation and exact particle-to-body confirmation as separate outcomes. */
-static int liquid_native_track_custom_stain_pick(
-    void *descriptor, const liquid_native_contact_t *contact,
-    int native_result, void *results)
-{
-    void *data = NULL;
-    int count = 0;
-    int body_confirmed;
-    float hit_view[3];
-    if (native_result < 0 || !contact ||
-        !liquid_native_pick_result_data(results, &data, &count) ||
-        !ptr_readable(data, 0x20)) return 0;
-    memcpy(hit_view, (const BYTE*)data + 0x14, sizeof(hit_view));
-    body_confirmed = liquid_confirm_particle_model_contact(contact, hit_view);
-    /* EXE+0x1f24ae skips creation only when the native result is negative.
-       A nonnegative pick can still fail the stricter particle attachment
-       check (surface gap, room ownership, or particle lifetime). TK17 will
-       create its decal anyway, so that new control must still be frozen.
-       Never promote the particle to a body contact to make freezing work. */
-    liquid_native_begin_frozen_capture(descriptor);
-    InterlockedIncrement(&liquid_native_animation_diag_generation);
-    InterlockedExchange(&liquid_native_animation_diag_emission,
-                        (LONG)contact->emission_id);
-    InterlockedExchange(&liquid_native_animation_diag_particle,
-                        (LONG)contact->particle_id);
-    InterlockedExchange(&liquid_native_animation_diag_last_tick, 0);
-    InterlockedExchange(&liquid_native_animation_diag_until_tick,
-                        (LONG)(GetTickCount() + 2500u));
-    return body_confirmed;
 }
 
 static int liquid_native_frozen_control_is_live(
@@ -10947,16 +10915,32 @@ static int THISCALL hook_AppPick_PickRay(
                 }
             }
             custom_contact_hit = 0;
-            if (used_custom_contact) {
-                custom_contact_hit = liquid_native_track_custom_stain_pick(
-                    native_descriptor, &contact, result, results);
-                if (!custom_contact_hit && result >= 0 && count > 0) {
+            if (used_custom_contact && count > 0 && data && ptr_readable(data, 0x20)) {
+                float hit_view[3];
+                memcpy(hit_view, (const BYTE*)data + 0x14, sizeof(hit_view));
+                custom_contact_hit = liquid_confirm_particle_model_contact(&contact, hit_view);
+                if (!custom_contact_hit) {
                     static int mismatch_logged;
                     if (mismatch_logged++ < 24)
                         log_line("liquid model attachment rejected particle=%u reason=hit-does-not-confirm-contact-surface", custom_particle_id);
                 }
             }
-            if (!custom_contact_hit) {
+            if (custom_contact_hit) {
+                liquid_native_begin_frozen_capture(native_descriptor);
+                InterlockedIncrement(
+                    &liquid_native_animation_diag_generation);
+                InterlockedExchange(
+                    &liquid_native_animation_diag_emission,
+                    (LONG)contact.emission_id);
+                InterlockedExchange(
+                    &liquid_native_animation_diag_particle,
+                    (LONG)custom_particle_id);
+                InterlockedExchange(
+                    &liquid_native_animation_diag_last_tick, 0);
+                InterlockedExchange(
+                    &liquid_native_animation_diag_until_tick,
+                    (LONG)(GetTickCount() + 2500u));
+            } else {
                 custom_contact_retried =
                     liquid_retry_native_model_contact(&contact, now);
             }
@@ -10988,11 +10972,9 @@ static int THISCALL hook_AppPick_PickRay(
                          custom_origin[2], custom_direction[0],
                          custom_direction[1], custom_direction[2]);
             }
-            log_line("liquid native stain contact consumed source=confirmed particle=%u emission=%u retry=%u result=%d count=%d native_hit=%d body_confirmed=%d retried=%d outcome=%s",
+            log_line("liquid native stain contact consumed source=confirmed particle=%u emission=%u retry=%u result=%d count=%d outcome=%s",
                      custom_particle_id, contact.emission_id,
                      contact.retry_count, result, count,
-                     used_custom_contact && result >= 0 && count > 0,
-                     custom_contact_hit, custom_contact_retried,
                      custom_contact_hit ?
                          (used_camera_fallback ?
                               "native-model-hit-camera-ray" :

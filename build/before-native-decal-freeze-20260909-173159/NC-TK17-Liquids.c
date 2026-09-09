@@ -24,7 +24,7 @@
 #define THISCALL __thiscall
 #endif
 
-#define LIQUIDS_VERSION "0.8.8-native-pick-freeze"
+#define LIQUIDS_VERSION "0.8.6-native-hook-recovery"
 #define TK17_EXE_TIMESTAMP 0x56EF69A0u
 #define TK17_EXE_IMAGE_SIZE 0x00312000u
 #define TK17_EXE_CHECKSUM 0x00304A16u
@@ -296,19 +296,11 @@ typedef struct liquid_native_contact_t {
 } liquid_native_contact_t;
 
 typedef struct liquid_native_frozen_control_t {
-    void *update;
     void *wrapper;
     void *object;
     void *group;
     DWORD added_tick;
 } liquid_native_frozen_control_t;
-
-typedef struct liquid_native_freeze_capture_t {
-    void *update;
-    void *descriptor;
-    void *group;
-    int first_control;
-} liquid_native_freeze_capture_t;
 
 typedef struct liquid_spermray_source_person_t {
     void *source;
@@ -629,7 +621,7 @@ static volatile LONG liquid_native_animation_diag_emission;
 static volatile LONG liquid_native_animation_diag_particle;
 static volatile LONG liquid_native_animation_diag_until_tick;
 static volatile LONG liquid_native_animation_diag_last_tick;
-static __thread liquid_native_freeze_capture_t *liquid_native_freeze_capture;
+static volatile LONG liquid_native_custom_stain_serial;
 static LONG liquid_native_animation_diag_snapshot_generation;
 static void *liquid_native_animation_diag_snapshot_node;
 static void *liquid_native_animation_diag_snapshot_control;
@@ -10194,36 +10186,18 @@ static int liquid_native_stain_control_count(void *group)
     return liquid_native_diag_array_count(controls, sizeof(*controls));
 }
 
-/* Match NativeStainUpdate's Weight dispatch (EXE+0x1f2046). The setter at
-   SYS+0xd7cb0 also invalidates dependent animation evaluators; writing +0x10
-   directly leaves their cached output unchanged. Do not pre-write the value:
-   the setter only notifies consumers when the weight actually changes. */
-static int liquid_native_set_stain_weight(void *object)
-{
-    typedef void (THISCALL *weight_set_t)(void *, unsigned int, float);
-    weight_set_t setter = (weight_set_t)liquid_node_method(
-        object, 0x238, 0x44);
-    if (!setter || !ptr_writable((BYTE*)object + 0x10, sizeof(float)))
-        return 0;
-    setter(object, 0x01fff08eu, 1.0f);
-    return 1;
-}
-
-static void liquid_native_track_frozen_control(
-    void *update, void *group, void *wrapper)
+static void liquid_native_track_frozen_control(void *group, void *wrapper)
 {
     liquid_native_frozen_control_t *slot;
     void *object = liquid_native_diag_control_object(wrapper);
     unsigned int slot_index;
     unsigned int index;
-    if (!update || !group || !wrapper || !object ||
-        !liquid_native_set_stain_weight(object))
+    if (!group || !wrapper || !object ||
+        !ptr_writable((BYTE*)object + 0x10, sizeof(float)))
         return;
 
     for (index = 0; index < LIQUID_NATIVE_FROZEN_CONTROL_SLOTS; index++) {
-        if (liquid_native_frozen_controls[index].update == update &&
-            liquid_native_frozen_controls[index].group == group &&
-            liquid_native_frozen_controls[index].wrapper == wrapper &&
+        if (liquid_native_frozen_controls[index].wrapper == wrapper &&
             liquid_native_frozen_controls[index].object == object)
             return;
     }
@@ -10231,23 +10205,17 @@ static void liquid_native_track_frozen_control(
     slot_index = liquid_native_frozen_control_cursor++ %
                  LIQUID_NATIVE_FROZEN_CONTROL_SLOTS;
     slot = &liquid_native_frozen_controls[slot_index];
-    slot->update = update;
     slot->wrapper = wrapper;
     slot->object = object;
     slot->group = group;
     slot->added_tick = GetTickCount();
     if (liquid_native_frozen_control_limit < slot_index + 1)
         liquid_native_frozen_control_limit = slot_index + 1;
-    {
-        static unsigned int logged;
-        if (logged++ < 24)
-            log_line("liquid native stain frozen update=%p group=%p wrapper=%p control=%p weight=1 mode=property-setter",
-                     update, group, wrapper, object);
-    }
+    *(float*)((BYTE*)object + 0x10) = 1.0f;
 }
 
 static void liquid_native_capture_new_frozen_controls(
-    void *update, void *group, int first_control)
+    void *group, int first_control)
 {
     void **controls;
     int control_count;
@@ -10260,102 +10228,25 @@ static void liquid_native_capture_new_frozen_controls(
                                                     sizeof(*controls));
     if (first_control >= control_count) return;
     for (index = first_control; index < control_count; index++)
-        liquid_native_track_frozen_control(update, group, controls[index]);
+        liquid_native_track_frozen_control(group, controls[index]);
 }
 
-/* The native loop can remove expired controls before picking, and can create
-   stains for several descriptors in one update. Snapshot at the successful
-   custom PickRay, then finish before the next native pick (or on update return).
-   This also covers the very first pick that discovers an emitter descriptor. */
-static void liquid_native_finish_frozen_capture(void)
-{
-    liquid_native_freeze_capture_t *capture = liquid_native_freeze_capture;
-    if (!capture || !capture->group) return;
-    if (!cfg.collision_native_decal_drip &&
-        liquid_native_stain_group(capture->update, capture->descriptor) ==
-            capture->group)
-        liquid_native_capture_new_frozen_controls(
-            capture->update, capture->group, capture->first_control);
-    capture->group = NULL;
-}
-
-static void liquid_native_begin_frozen_capture(void *descriptor)
-{
-    liquid_native_freeze_capture_t *capture = liquid_native_freeze_capture;
-    if (!capture || cfg.collision_native_decal_drip ||
-        !liquid_native_descriptor_in_update(capture->update, descriptor))
-        return;
-    capture->descriptor = descriptor;
-    capture->group = liquid_native_stain_group(capture->update, descriptor);
-    capture->first_control = liquid_native_stain_control_count(capture->group);
-}
-
-/* Called only after submitting a custom liquid ray. Keep native decal
-   creation and exact particle-to-body confirmation as separate outcomes. */
-static int liquid_native_track_custom_stain_pick(
-    void *descriptor, const liquid_native_contact_t *contact,
-    int native_result, void *results)
-{
-    void *data = NULL;
-    int count = 0;
-    int body_confirmed;
-    float hit_view[3];
-    if (native_result < 0 || !contact ||
-        !liquid_native_pick_result_data(results, &data, &count) ||
-        !ptr_readable(data, 0x20)) return 0;
-    memcpy(hit_view, (const BYTE*)data + 0x14, sizeof(hit_view));
-    body_confirmed = liquid_confirm_particle_model_contact(contact, hit_view);
-    /* EXE+0x1f24ae skips creation only when the native result is negative.
-       A nonnegative pick can still fail the stricter particle attachment
-       check (surface gap, room ownership, or particle lifetime). TK17 will
-       create its decal anyway, so that new control must still be frozen.
-       Never promote the particle to a body contact to make freezing work. */
-    liquid_native_begin_frozen_capture(descriptor);
-    InterlockedIncrement(&liquid_native_animation_diag_generation);
-    InterlockedExchange(&liquid_native_animation_diag_emission,
-                        (LONG)contact->emission_id);
-    InterlockedExchange(&liquid_native_animation_diag_particle,
-                        (LONG)contact->particle_id);
-    InterlockedExchange(&liquid_native_animation_diag_last_tick, 0);
-    InterlockedExchange(&liquid_native_animation_diag_until_tick,
-                        (LONG)(GetTickCount() + 2500u));
-    return body_confirmed;
-}
-
-static int liquid_native_frozen_control_is_live(
-    void *update, const liquid_native_frozen_control_t *slot)
-{
-    void **groups, **controls;
-    int count, index;
-    if (!ptr_readable((BYTE*)update + 0x18, sizeof(groups))) return 0;
-    groups = *(void***)((BYTE*)update + 0x18);
-    count = liquid_native_diag_array_count(groups, sizeof(*groups));
-    for (index = 0; index < count; index++)
-        if (groups[index] == slot->group) break;
-    if (index >= count ||
-        !ptr_readable((BYTE*)slot->group + 0x10, sizeof(controls))) return 0;
-    controls = *(void***)((BYTE*)slot->group + 0x10);
-    count = liquid_native_diag_array_count(controls, sizeof(*controls));
-    for (index = 0; index < count; index++)
-        if (controls[index] == slot->wrapper)
-            return liquid_native_diag_control_object(slot->wrapper) ==
-                slot->object;
-    return 0;
-}
-
-static void liquid_native_hold_custom_stain_weights(void *update)
+static void liquid_native_hold_custom_stain_weights(void)
 {
     unsigned int index;
     if (cfg.collision_native_decal_drip) return;
     for (index = 0; index < liquid_native_frozen_control_limit; index++) {
         liquid_native_frozen_control_t *slot =
             &liquid_native_frozen_controls[index];
-        if (slot->update != update || !slot->wrapper || !slot->object) continue;
-        if (!liquid_native_frozen_control_is_live(update, slot) ||
-            !liquid_native_set_stain_weight(slot->object)) {
+        void *current_object;
+        if (!slot->wrapper || !slot->object) continue;
+        current_object = liquid_native_diag_control_object(slot->wrapper);
+        if (current_object != slot->object ||
+            !ptr_writable((BYTE*)slot->object + 0x10, sizeof(float))) {
             memset(slot, 0, sizeof(*slot));
             continue;
         }
+        *(float*)((BYTE*)slot->object + 0x10) = 1.0f;
     }
     while (liquid_native_frozen_control_limit > 0) {
         liquid_native_frozen_control_t *tail =
@@ -10705,12 +10596,19 @@ static void THISCALL hook_NativeStainUpdate(
         model_emitter->native_stain_descriptor : NULL;
     LONG descriptor_emission = model_emitter ?
         (LONG)model_emitter->emission_id : 0;
-    liquid_native_freeze_capture_t capture = {0};
-    liquid_native_freeze_capture_t *previous_capture =
-        liquid_native_freeze_capture;
+    LONG custom_stain_serial_before = InterlockedCompareExchange(
+        &liquid_native_custom_stain_serial, 0, 0);
+    void *stain_group_before = NULL;
+    int stain_control_count_before = -1;
     int armed = 0;
-    capture.update = self;
-    liquid_native_freeze_capture = &capture;
+    /* Group walking is only needed while this update owns an emitter with a
+       queued custom contact. Native updates unrelated to custom liquid stay
+       on the original engine fast path. */
+    if (model_emitter && !cfg.collision_native_decal_drip) {
+        stain_group_before = liquid_native_stain_group(self, descriptor);
+        stain_control_count_before =
+            liquid_native_stain_control_count(stain_group_before);
+    }
     if (cfg.liquids_enabled && cfg.collision_spawn_model_stains &&
         emission_id && descriptor_emission == (LONG)emission_id &&
         liquid_native_model_contact_pending(emission_id, now) &&
@@ -10745,12 +10643,20 @@ static void THISCALL hook_NativeStainUpdate(
     if (tramp_NativeStainUpdate)
         tramp_NativeStainUpdate(self, update_context, receiver,
                                 result_state);
-    liquid_native_finish_frozen_capture();
-    liquid_native_freeze_capture = previous_capture;
-    liquid_native_hold_custom_stain_weights(self);
     if (cfg.enabled)
         liquid_native_animation_diag_sample(self);
     liquid_apply_testicular_retraction_weights();
+    if (!cfg.collision_native_decal_drip &&
+        InterlockedCompareExchange(&liquid_native_custom_stain_serial, 0, 0) !=
+            custom_stain_serial_before) {
+        void *stain_group_after =
+            liquid_native_stain_group(self, descriptor);
+        if (stain_group_after == stain_group_before &&
+            stain_control_count_before >= 0)
+            liquid_native_capture_new_frozen_controls(
+                stain_group_after, stain_control_count_before);
+    }
+    liquid_native_hold_custom_stain_weights();
 }
 
 /* Observe TK17's own ray-hit path without changing its result.  The native
@@ -10832,7 +10738,6 @@ static int THISCALL hook_AppPick_PickRay(
         caller == (const BYTE*)GetModuleHandleA(NULL) +
                       LIQUID_NATIVE_STAIN_PICK_CALLER_RVA;
     if (native_stain_caller) {
-        liquid_native_finish_frozen_capture();
         native_frame = __builtin_frame_address(1);
         if (native_frame &&
             ptr_readable((const BYTE*)native_frame - 0x14, sizeof(void*)))
@@ -10947,16 +10852,32 @@ static int THISCALL hook_AppPick_PickRay(
                 }
             }
             custom_contact_hit = 0;
-            if (used_custom_contact) {
-                custom_contact_hit = liquid_native_track_custom_stain_pick(
-                    native_descriptor, &contact, result, results);
-                if (!custom_contact_hit && result >= 0 && count > 0) {
+            if (used_custom_contact && count > 0 && data && ptr_readable(data, 0x20)) {
+                float hit_view[3];
+                memcpy(hit_view, (const BYTE*)data + 0x14, sizeof(hit_view));
+                custom_contact_hit = liquid_confirm_particle_model_contact(&contact, hit_view);
+                if (!custom_contact_hit) {
                     static int mismatch_logged;
                     if (mismatch_logged++ < 24)
                         log_line("liquid model attachment rejected particle=%u reason=hit-does-not-confirm-contact-surface", custom_particle_id);
                 }
             }
-            if (!custom_contact_hit) {
+            if (custom_contact_hit) {
+                InterlockedIncrement(&liquid_native_custom_stain_serial);
+                InterlockedIncrement(
+                    &liquid_native_animation_diag_generation);
+                InterlockedExchange(
+                    &liquid_native_animation_diag_emission,
+                    (LONG)contact.emission_id);
+                InterlockedExchange(
+                    &liquid_native_animation_diag_particle,
+                    (LONG)custom_particle_id);
+                InterlockedExchange(
+                    &liquid_native_animation_diag_last_tick, 0);
+                InterlockedExchange(
+                    &liquid_native_animation_diag_until_tick,
+                    (LONG)(GetTickCount() + 2500u));
+            } else {
                 custom_contact_retried =
                     liquid_retry_native_model_contact(&contact, now);
             }
@@ -10988,11 +10909,9 @@ static int THISCALL hook_AppPick_PickRay(
                          custom_origin[2], custom_direction[0],
                          custom_direction[1], custom_direction[2]);
             }
-            log_line("liquid native stain contact consumed source=confirmed particle=%u emission=%u retry=%u result=%d count=%d native_hit=%d body_confirmed=%d retried=%d outcome=%s",
+            log_line("liquid native stain contact consumed source=confirmed particle=%u emission=%u retry=%u result=%d count=%d outcome=%s",
                      custom_particle_id, contact.emission_id,
                      contact.retry_count, result, count,
-                     used_custom_contact && result >= 0 && count > 0,
-                     custom_contact_hit, custom_contact_retried,
                      custom_contact_hit ?
                          (used_camera_fallback ?
                               "native-model-hit-camera-ray" :
