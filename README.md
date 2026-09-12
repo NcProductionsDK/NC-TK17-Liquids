@@ -1,6 +1,220 @@
 # NC-TK17-Liquids
 
-## Native decal freeze (0.8.8, pending gameplay verification)
+## Native D3D8 rendering cost (0.8.17, pending gameplay verification)
+
+The 0.8.16 gameplay tests confirm liquid renders in both native D3D8 and Hook5.
+Hook5 behavior and performance passed. The native log has roughly 15–20 native
+update samples per second before emission and 13–14 during most of emission;
+these samples are not a direct FPS measurement or a plugin-disabled baseline.
+The existing native-update timer excludes the expensive graphics path.
+
+Native D3D8 now saves only the render states changed by each depth replay,
+instead of creating/capturing/applying/deleting a full state block per scene
+draw. UP draws also preserve the stream/index bindings which replay clears.
+The upload texture is reused, with release on device reset or target change.
+The shared native compositor reuses its depth comparison states. Depth texture
+creation keeps the existing path: retaining that texture required another full
+frame upload resource and GPU copy without improving the isolated timing.
+
+The D3D8 color readback and texture update now cover only the final liquid
+geometry bounds. The screen quad covers that same rectangle, so unused/stale
+texture pixels cannot appear. Resolution, projection, full scene depth capture,
+collision sampling and shader output are preserved. Hook5 uses the original
+draw entry point with bounds collection disabled; OpenGL keeps full readback.
+
+`native D3D8 rendering performance` reports average CPU wall times for depth
+readback, shared composition, texture upload and overlay, plus replay submission
+cost, replay count, copied pixels and submission failures once per second when
+diagnostics are enabled. GPU waits are included in the API stage that waits;
+these are not GPU timestamps or total game frame timings.
+
+The actual D3D11 compositor tests cover normal/reversed occlusion, repeated
+depth replacement, release/resize, and moving/cropped output matching full
+readback pixel-for-pixel at screen edges. A mocked D3D8 device verifies all four
+draw paths restore targets, viewport, color/stencil and UP binding state, plus
+failed-capture and idle bypass. A 60-frame 2560x1368 single-droplet fixture after
+10 warmup frames measured about 6.0 ms before and 3.9 ms with cropped readback;
+this isolated compositor comparison does not predict gameplay FPS.
+Renderer readiness, hook chaining, decal orientation and freeze regressions
+pass, as does the real OpenGL context test. The standalone real D3D8 test still
+cannot create a device (`0x8876086a`), before any liquid rendering; gameplay
+validation of the new replay and cropped overlay is therefore still required.
+
+Retest native D3D8 in the same scene with diagnostics enabled, comparing idle
+and emission. Also compare the master switch off to distinguish native game
+cost from liquid rendering cost. Full-depth replay and cross-API synchronization
+remain, so matching Hook5 performance is not established.
+
+## Renderer readiness (0.8.16, gameplay verified; native performance addressed above)
+
+Registering callbacks with Hook5 Extended no longer disables native rendering.
+The extension accepts callback pointers even when Hook5 is absent. Previously
+this disabled native OpenGL/D3D8 while no Hook5 callback drove simulation or
+configuration reload, leaving a working menu and emission triggers but no liquid.
+
+Native rendering is excluded when Hook5's effects module, either known Hook5
+D3D8 executable timestamp, or actual Hook5 D3D11 callback execution identifies
+the Hook5 path. Loading Hook5 Extended alone is insufficient. The executable
+compatibility check is unchanged. Native depth mirroring/composition remains
+excluded from identified Hook5 rendering, including before its first callback.
+
+Startup reports initialized hooks and pending renderer activation rather than
+treating callback registration as an active graphics device. While emission is
+active, a missing frame/Hook5 scene update produces `liquid renderer stalled`
+after one second, once per emission. This gives affected users a specific reason
+to provide the Hook5 Extended log if their actual Hook5 bridge is not running.
+This change does not repair unknown Hook5 bridge failures or accept unsupported
+game executables; the two public logs do not establish their exact renderer.
+
+The old registration-only failure is reproduced by a baseline test.
+`renderer_readiness_test` covers native rendering with registered callbacks,
+both known Hook5 timestamps, effects-module loading, actual callback evidence,
+and healthy/stalled diagnostics. The shared compositor/depth, hook chaining,
+decal orientation and freeze tests pass. The real OpenGL context test renders
+with all Hook5 registration flags set. Real D3D8 testing is blocked on this
+machine by device creation returning `0x8876086a`, before liquid rendering.
+Test the non-Hook5 launcher case and normal Hook5 gameplay before distribution.
+
+## Contact accuracy and diagnostic cost (0.8.13, pending gameplay verification)
+
+The high `body_confirmed=0` count in 0.8.12 did not mean that every reported
+droplet lacked body attachment. The log shows PhysX-owned body impacts followed
+by native picks on clothing (`NcBlouse4_group_mesh`), whose positions need not
+match the collision shell. PhysX ownership already drives body following.
+The contact check now reports `physx-owner`, `previous-mesh`, and `exact-mesh`
+separately. It retains existing ownership without moving the droplet, claiming
+an exact mesh match, or requesting another attachment. Unknown contacts still
+require the same exact distance check; room and expired-particle checks remain.
+
+Independent verification previously accepted leftover result data even when
+the native picker returned failure. It now checks the return code first. The
+regression reproduces false ownership with 0.8.12 and passes with this version.
+The cosmetic camera fallback also recognizes a negative result with stale data.
+
+Optional ownership probes share a 1 ms allowance per native update, with the
+existing 16-query ceiling per callback and three-attempt limit per particle.
+An individual engine query cannot be interrupted; remaining probes are deferred
+without spending their retries. The actual decal-placement pick is unaffected
+by this allowance. Tests cover budget sharing, eventual coverage and stale hits.
+
+Diagnostic messages use a persistent 64 KiB buffered file, flushed on logging
+at 250 ms intervals and closed/flushed on diagnostic disable or DLL detach.
+This avoids opening and closing the file per message. A concurrent 1,000-message
+fixture measured about 180 ms before and 3.8 ms after; these are logging timings,
+not game FPS. Detailed stain snapshots require deep capture and a 300 ms pause
+in new contacts. Per-contact details stop after 24 samples; once-per-second
+`liquid attachment summary` reports native-pick ownership outcomes plus probe
+counts and budget deferrals. Existing update timing summaries remain available.
+
+Ownership, stale-hit, probe-budget, concurrent logging, settings reload, surface
+orientation, native freeze and 768-control load regressions pass. In-game timing
+and attachment validation remain necessary. Configuration values are unchanged.
+
+## Decal freeze and update cost (0.8.12, user reports improved gameplay)
+
+The September 12 diagnostic segment contains 801 successful native picks for
+384 distinct droplets, including 417 repeat successes. A native success could
+fail the separate particle attachment check and queue another decal-producing
+pick. Retries now stop after native success; actual misses retain their bounded
+retries, and independent body-ownership probes still verify droplet attachment.
+
+Freeze ownership now uses a growing, sorted registry instead of a 512-entry
+overwrite ring. A 768-live-control regression loses 256 freeze records with
+0.8.11 and none with this version. This proves a route by which decals could
+resume animating, though the log cannot identify each visually reported case.
+
+A signature-checked hook at EXE+0x1f2060 clamps tracked controls' Weight setter
+argument before native animation invalidation. Native traversal supplies the
+live group, wrapper and object identity; logarithmic registry lookup replaces
+per-control group/list scans. The end-of-update pass prunes unvisited records
+without dereferencing stale objects or calling the setter a second time. New
+custom controls still receive the native setter immediately. Ordinary native
+controls, `native_decal_drip=true`, and native expiration decisions retain their
+existing paths. If the hook cannot install, validated post-update freezing
+remains available as a slower fallback.
+
+The synthetic load test measures about 0.11 ms for the new hook, fake native
+setter and cleanup with 768 decals, versus about 4.3 ms for the old maintenance
+pass which retained only 512 of those decals. These are CPU fixture timings,
+not measured game FPS. Actual render cost still depends on visible decals.
+The tests execute the real stolen instructions and trampoline, preserve x87
+state, and cover toggles, native isolation, stale ownership, exact contact
+checks, retries, surface alignment and the vertical texture flip.
+
+Animation diagnostic sampling now keeps its 100 ms throttle during bursts.
+With diagnostics enabled, `liquid native update performance` reports average
+native/pick, freeze cleanup, and diagnostics/retraction times, peak total time,
+tracked count, build version and hook status once per second. No user settings
+or decal rate limits were changed. Restart and compare fresh decals in game;
+check both sustained frame rate and static textures across repeated bursts.
+
+## Vertical decal orientation (0.8.11, user-verified in game)
+
+Reflect liquid decals vertically about their picked center by reversing only
+the final projector Y coordinate. Horizontal orientation, mesh-normal depth,
+unit scale, native sizing, and contact placement are preserved. This addresses
+the upside-down texture reported after the surface alignment was validated.
+The surface regression checks signed vertical orientation, unchanged horizontal
+direction, and camera roll as well as the existing hook and placement checks.
+
+## Surface-aligned decals (0.8.10, user-verified in game)
+
+The user confirmed that liquid decals are no longer warped or distorted.
+
+Liquid-created decals now use the picked mesh normal for perpendicular
+projection, with a gravity-upright texture orientation independent of the
+incoming droplet direction. TK17 still supplies the exact contact point and
+configured decal size. Curved surfaces can still bend a projected texture.
+
+The native stain routine overwrites the matrix previously adjusted during
+`PickRay`: it loads an inverse model-view matrix or identity after the pick.
+A signature-checked hook at EXE+0x1f2537 applies the surface rotation after
+both paths, before native centering and sizing. The normalized view-space
+mesh normal is read from `PickResult+0x20`, verified against the APP code.
+The pending correction belongs to the current custom pick and update frame;
+ordinary native/POV picks retain their native placement. Invalid normals
+leave the existing placement in place. Decal freezing and emitter offsets
+retain their existing behavior.
+
+`surface_decal_test` verifies equal tangent scale, the native matrix overwrite
+regression, unchanged hit data, POV isolation, camera roll, and invalid normals.
+It also executes the actual instruction hook and trampoline with a live x87
+value to check preservation. Collision ownership, native decal freeze, and
+world emitter regression tests pass. Diagnostics include `liquid surface decal aligned` when
+the final matrix correction runs.
+
+## Emitter position adjustment (0.8.9, user-approved checkpoint)
+
+`[penis_liquid_emitter_position] position_x`, `position_y`, and `position_z` accept
+values from -1 to 1. Each unit is 0.01 render-world units (approximately 1 cm).
+Zero preserves the original `penis_jointEnd` pivot. The settings apply to all
+model emitters; the native POV tool is unaffected.
+
+The in-game X/Y/Z sliders save through the DLL's settings bindings and use the
+normal 500 ms INI reload. X moves left/right, Y down/up, and Z back/forward
+along the original emission direction. These are emitter-relative directions,
+not screen directions: tip-local Y supplies the up reference and the basis
+rotates with the bone. A tip-local Z reference handles an up/aim degeneracy.
+Normalizing the basis removes inherited scale/shear from the offset distance.
+The tip frame uses the same private PhysX-aware hierarchy evaluation as the
+existing pivot resolver, including the tip's own orientation. Emission aim
+and bone transforms remain unchanged.
+
+Changes invalidate source interpolation history so new births use the adjusted
+source. Existing droplets retain their positions, velocities, and contacts.
+Missing or invalid settings default to zero; finite values are clamped to the
+supported range. The default-config generator includes all three keys.
+
+`world_emitter_test` passes with the real engine evaluator for signed axes,
+half/full range, nonuniform scale, tip roll, unchanged aim, and zero reset.
+`contact_settings_test` passes for UI writes, actual config reload, preserved
+particles, limits, and missing/invalid values. In game, verify alignment with
+each slider while rotating/posing the model; reset all three to zero afterward.
+
+## Native decal freeze (0.8.8, user-verified in game)
+
+The user confirmed that `native_decal_drip = false` keeps new decals static
+after testing 0.8.8.
 
 The 0.8.7 gameplay retest still showed animated decals. Its diagnostic log
 confirmed only 19 frozen controls: many custom picks returned a native hit

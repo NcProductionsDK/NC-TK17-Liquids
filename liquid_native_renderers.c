@@ -9,6 +9,7 @@ static struct {
     ID3D11Device *device;
     ID3D11DeviceContext *context;
     ID3D11Texture2D *color, *readback;
+    ID3D11DepthStencilState *depth_states[8];
     ID3D11RenderTargetView *target;
     ID3D11BlendState *blend;
     UINT width, height;
@@ -18,12 +19,13 @@ static struct {
     D3DMATRIX projection;
     D3DVIEWPORT8 viewport;
     int projection_valid;
+    int crop_readback;
+    RECT output_rect;
 } liquid_native;
 
 static int liquid_native_allowed(void)
 {
-    return !hook5_present_registered && !hook5_d3d11_scene_registered &&
-           !GetModuleHandleA("d3d8_heffects.dll");
+    return !liquid_hook5_renderer_present();
 }
 
 static void liquid_native_release_targets(void)
@@ -141,7 +143,8 @@ static int liquid_native_composite(D3D11_COMPARISON_FUNC comparison)
     UINT y;
     int ok = 0;
     if (!liquid_native.projection_valid || !captured_camera_inverse_valid ||
-        !liquid_native.device || !liquid_native.depth || !liquid_native.target) return 0;
+        !liquid_native.device || !liquid_native.depth || !liquid_native.target ||
+        comparison < D3D11_COMPARISON_NEVER || comparison > D3D11_COMPARISON_ALWAYS) return 0;
     captured_d3d_projection = liquid_native.projection;
     captured_d3d_viewport = liquid_native.viewport;
     captured_d3d_viewport.X = captured_d3d_viewport.Y = 0;
@@ -166,8 +169,10 @@ static int liquid_native_composite(D3D11_COMPARISON_FUNC comparison)
     depth_state_desc.DepthEnable = TRUE;
     depth_state_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
     depth_state_desc.DepthFunc = comparison;
-    if (FAILED(ID3D11Device_CreateDepthStencilState(liquid_native.device,
-        &depth_state_desc, &state))) goto cleanup;
+    if (!liquid_native.depth_states[comparison - 1] &&
+        FAILED(ID3D11Device_CreateDepthStencilState(liquid_native.device,
+        &depth_state_desc, &liquid_native.depth_states[comparison - 1]))) goto cleanup;
+    state = liquid_native.depth_states[comparison - 1];
     if (!liquid_ensure_d3d11_resources(liquid_native.device)) goto cleanup;
     ID3D11DeviceContext_OMSetRenderTargets(liquid_native.context, 1, &liquid_native.target, dsv);
     ID3D11DeviceContext_OMSetDepthStencilState(liquid_native.context, state, 0);
@@ -176,23 +181,31 @@ static int liquid_native_composite(D3D11_COMPARISON_FUNC comparison)
        must accumulate alpha. Restore the Hook5 state object after this call. */
     saved_blend = liquid_d3d11_blend_state;
     liquid_d3d11_blend_state = liquid_native.blend;
-    liquid_draw_particles_d3d11_target(NULL, liquid_native.context, liquid_native.target,
-                                      dsv, desc.Width, desc.Height);
+    liquid_native.output_rect = (RECT){0, 0, desc.Width, desc.Height};
+    liquid_draw_particles_d3d11_target_bounds(NULL, liquid_native.context, liquid_native.target,
+        dsv, desc.Width, desc.Height, liquid_native.crop_readback ? &liquid_native.output_rect : NULL);
     liquid_d3d11_blend_state = saved_blend;
     ID3D11DeviceContext_OMSetRenderTargets(liquid_native.context, 0, NULL, NULL);
-    ID3D11DeviceContext_CopyResource(liquid_native.context,
-        (ID3D11Resource*)liquid_native.readback, (ID3D11Resource*)liquid_native.color);
+    if (liquid_native.output_rect.right <= liquid_native.output_rect.left ||
+        liquid_native.output_rect.bottom <= liquid_native.output_rect.top) { ok = 1; goto cleanup; }
+    {
+        const RECT *r = &liquid_native.output_rect;
+        D3D11_BOX box = {r->left, r->top, 0, r->right, r->bottom, 1};
+        ID3D11DeviceContext_CopySubresourceRegion(liquid_native.context,
+            (ID3D11Resource*)liquid_native.readback, 0, r->left, r->top, 0,
+            (ID3D11Resource*)liquid_native.color, 0, &box);
+    }
     if (FAILED(ID3D11DeviceContext_Map(liquid_native.context,
         (ID3D11Resource*)liquid_native.readback, 0, D3D11_MAP_READ, 0, &mapped))) goto cleanup;
-    for (y = 0; y < desc.Height; y++)
-        memcpy(liquid_native.rgba + (size_t)y * desc.Width * 4,
-               (BYTE*)mapped.pData + (size_t)y * mapped.RowPitch, desc.Width * 4);
+    for (y = liquid_native.output_rect.top; y < (UINT)liquid_native.output_rect.bottom; y++)
+        memcpy(liquid_native.rgba + ((size_t)y * desc.Width + liquid_native.output_rect.left) * 4,
+               (BYTE*)mapped.pData + (size_t)y * mapped.RowPitch + liquid_native.output_rect.left * 4,
+               (liquid_native.output_rect.right - liquid_native.output_rect.left) * 4);
     ID3D11DeviceContext_Unmap(liquid_native.context, (ID3D11Resource*)liquid_native.readback, 0);
     ok = 1;
 cleanup:
     ID3D11DeviceContext_OMSetRenderTargets(liquid_native.context, 0, NULL, NULL);
     ID3D11DeviceContext_OMSetDepthStencilState(liquid_native.context, NULL, 0);
-    if (state) ID3D11DepthStencilState_Release(state);
     if (dsv) ID3D11DepthStencilView_Release(dsv);
     if (depth) ID3D11Texture2D_Release(depth);
     return ok;
@@ -310,6 +323,7 @@ static void liquid_native_gl_frame(void)
     GLuint texture = 0;
     UINT y, x;
     if (!liquid_native_allowed() || liquid_native.busy || !liquid_native_gl_load()) return;
+    InterlockedExchange(&liquid_renderer_tick, (LONG)GetTickCount());
     InterlockedExchange(&graphics_hook_ready, 1);
     liquid_simulation_tick();
     if (!cfg.liquids_enabled || !liquid_has_active_particles()) {
@@ -429,6 +443,8 @@ static liquid_ndrawiup_t liquid_ndrawiup;
 static liquid_nreset_t liquid_nreset;
 static IDirect3DSurface8 *liquid_native_depth8;
 static IDirect3DSurface8 *liquid_native_color8;
+static IDirect3DTexture8 *liquid_native_texture8;
+static UINT liquid_native_texture8_width, liquid_native_texture8_height;
 static D3DFORMAT liquid_native_depth8_format;
 static D3DFORMAT liquid_native_color8_format;
 static IDirect3DDevice8 *liquid_native_device8;
@@ -436,6 +452,57 @@ static UINT liquid_native_depth8_width, liquid_native_depth8_height;
 static int liquid_native_depth8_valid;
 static D3D11_COMPARISON_FUNC liquid_native_depth8_func = D3D11_COMPARISON_LESS_EQUAL;
 static void liquid_native_d3d8_submit(IDirect3DDevice8 *device, int inside_scene);
+
+static struct {
+    double stages[5], peak_submit, copied_pixels;
+    unsigned int submissions, replays, failed;
+    DWORD last;
+} liquid_native_perf;
+
+static double liquid_native_clock_ms(void)
+{
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    if (!cfg.enabled) return 0;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    if (!frequency.QuadPart) return 0;
+    QueryPerformanceCounter(&counter);
+    return counter.QuadPart * (1000.0 / frequency.QuadPart);
+}
+
+static void liquid_native_perf_stage(int stage, double *stamp)
+{
+    double now;
+    if (!*stamp || !cfg.enabled) return;
+    now = liquid_native_clock_ms();
+    liquid_native_perf.stages[stage] += now - *stamp;
+    *stamp = now;
+}
+
+static void liquid_native_perf_report(double start, int success)
+{
+    DWORD now = GetTickCount();
+    double elapsed;
+    unsigned int n;
+    if (!start || !cfg.enabled) return;
+    elapsed = liquid_native_clock_ms() - start;
+    if (elapsed > liquid_native_perf.peak_submit) liquid_native_perf.peak_submit = elapsed;
+    liquid_native_perf.submissions++;
+    if (!success) liquid_native_perf.failed++;
+    if (!liquid_native_perf.last) liquid_native_perf.last = now;
+    if (now - liquid_native_perf.last < 1000) return;
+    n = liquid_native_perf.submissions;
+    /* CPU wall time includes GPU waits in LockRect/Map. Replay time includes
+       CPU submission only; queued GPU work can finish during depth readback. */
+    log_line("native D3D8 rendering performance submissions=%u failed=%u size=%ux%u depth_read_ms=%.3f shared_composite_ms=%.3f texture_upload_ms=%.3f overlay_ms=%.3f replay_cpu_ms=%.3f replay_draws=%u peak_submit_ms=%.3f readback_pixels=%.0f",
+        n, liquid_native_perf.failed, liquid_native.width, liquid_native.height,
+        liquid_native_perf.stages[0] / n, liquid_native_perf.stages[1] / n,
+        liquid_native_perf.stages[2] / n, liquid_native_perf.stages[3] / n,
+        liquid_native_perf.stages[4] / n, liquid_native_perf.replays,
+        liquid_native_perf.peak_submit, liquid_native_perf.copied_pixels / n);
+    memset(&liquid_native_perf, 0, sizeof(liquid_native_perf));
+    liquid_native_perf.last = now;
+}
 
 static int liquid_native_is_backbuffer8(IDirect3DDevice8 *device)
 {
@@ -450,6 +517,8 @@ static int liquid_native_is_backbuffer8(IDirect3DDevice8 *device)
 
 static void liquid_native_release_depth8(void)
 {
+    if (liquid_native_texture8) IDirect3DTexture8_Release(liquid_native_texture8);
+    liquid_native_texture8 = NULL;
     if (liquid_native_depth8) IDirect3DSurface8_Release(liquid_native_depth8);
     if (liquid_native_color8) IDirect3DSurface8_Release(liquid_native_color8);
     liquid_native_color8 = NULL;
@@ -524,7 +593,12 @@ static HRESULT WINAPI liquid_native_Clear(IDirect3DDevice8 *device, DWORD count,
 
 typedef struct liquid_depth_replay_t {
     IDirect3DSurface8 *target, *depth;
-    DWORD state;
+    DWORD color_write, stencil;
+    IDirect3DVertexBuffer8 *stream;
+    IDirect3DIndexBuffer8 *indices;
+    UINT stride, base_vertex;
+    int user_memory;
+    double started;
     D3DVIEWPORT8 viewport;
     int ready;
 } liquid_depth_replay_t;
@@ -535,8 +609,9 @@ static void liquid_native_replay_begin(IDirect3DDevice8 *device, liquid_depth_re
     D3DVIEWPORT8 viewport;
     DWORD zwrite = 0, zenable = 0, stencil = 0, zfunc = D3DCMP_LESSEQUAL;
     memset(replay, 0, sizeof(*replay));
-    if (liquid_native.busy || !liquid_native_allowed() || !cfg.liquids_enabled ||
-        !liquid_runtime_work_active(GetTickCount()) || !liquid_native_is_backbuffer8(device)) return;
+    if (liquid_native.busy || !cfg.liquids_enabled ||
+        !liquid_runtime_work_active(GetTickCount()) || !liquid_native_allowed() ||
+        !liquid_native_is_backbuffer8(device)) return;
     if (FAILED(IDirect3DDevice8_GetTransform(device, D3DTS_PROJECTION, &projection))) return;
     if (fabsf(projection._34) < 0.1f || fabsf(projection._44) > 0.001f) {
         if (liquid_native.projection_valid && liquid_native_depth8_valid)
@@ -558,8 +633,11 @@ static void liquid_native_replay_begin(IDirect3DDevice8 *device, liquid_depth_re
     }
     liquid_native.projection_valid = 1;
     if (!liquid_native_depth8_valid || device != liquid_native_device8) return;
-    IDirect3DDevice8_GetRenderState(device, D3DRS_STENCILENABLE, &stencil);
-    IDirect3DDevice8_GetRenderState(device, D3DRS_ZFUNC, &zfunc);
+    if (FAILED(IDirect3DDevice8_GetRenderState(device, D3DRS_STENCILENABLE, &stencil)) ||
+        FAILED(IDirect3DDevice8_GetRenderState(device, D3DRS_ZFUNC, &zfunc))) {
+        liquid_native_depth8_valid = 0;
+        return;
+    }
     if (stencil) {
         DWORD func = D3DCMP_ALWAYS;
         IDirect3DDevice8_GetRenderState(device, D3DRS_STENCILFUNC, &func);
@@ -571,9 +649,14 @@ static void liquid_native_replay_begin(IDirect3DDevice8 *device, liquid_depth_re
         }
     }
     liquid_native_depth8_func = (D3D11_COMPARISON_FUNC)zfunc;
+    replay->started = liquid_native_clock_ms();
+    /* A scene draw does not mutate render state. Save only the two states
+       changed by the mirror pass, instead of allocating a full state block
+       for every piece of scene geometry. UP draws save bindings separately. */
     if (FAILED(IDirect3DDevice8_GetRenderTarget(device, &replay->target)) ||
         FAILED(IDirect3DDevice8_GetDepthStencilSurface(device, &replay->depth)) ||
-        FAILED(IDirect3DDevice8_CreateStateBlock(device, D3DSBT_ALL, &replay->state))) goto fail;
+        FAILED(IDirect3DDevice8_GetRenderState(device, D3DRS_COLORWRITEENABLE, &replay->color_write))) goto fail;
+    replay->stencil = stencil;
     if (FAILED(IDirect3DDevice8_SetRenderTarget(device, liquid_native_color8, liquid_native_depth8))) goto fail;
     replay->viewport = viewport;
     IDirect3DDevice8_SetViewport(device, &viewport);
@@ -582,7 +665,6 @@ static void liquid_native_replay_begin(IDirect3DDevice8 *device, liquid_depth_re
     replay->ready = 1;
     return;
 fail:
-    if (replay->state) IDirect3DDevice8_DeleteStateBlock(device, replay->state);
     if (replay->depth) IDirect3DSurface8_Release(replay->depth);
     if (replay->target) IDirect3DSurface8_Release(replay->target);
     memset(replay, 0, sizeof(*replay));
@@ -591,10 +673,37 @@ static void liquid_native_replay_end(IDirect3DDevice8 *device, liquid_depth_repl
 {
     if (!replay->ready) return;
     IDirect3DDevice8_SetRenderTarget(device, replay->target, replay->depth);
-    IDirect3DDevice8_ApplyStateBlock(device, replay->state);
+    IDirect3DDevice8_SetRenderState(device, D3DRS_COLORWRITEENABLE, replay->color_write);
+    IDirect3DDevice8_SetRenderState(device, D3DRS_STENCILENABLE, replay->stencil);
     IDirect3DDevice8_SetViewport(device, &replay->viewport);
-    IDirect3DDevice8_DeleteStateBlock(device, replay->state);
+    if (replay->user_memory) {
+        IDirect3DDevice8_SetStreamSource(device, 0, replay->stream, replay->stride);
+        IDirect3DDevice8_SetIndices(device, replay->indices, replay->base_vertex);
+        if (replay->stream) IDirect3DVertexBuffer8_Release(replay->stream);
+        if (replay->indices) IDirect3DIndexBuffer8_Release(replay->indices);
+    }
     IDirect3DSurface8_Release(replay->depth); IDirect3DSurface8_Release(replay->target);
+    if (replay->started) {
+        liquid_native_perf_stage(4, &replay->started);
+        liquid_native_perf.replays++;
+    }
+}
+
+static void liquid_native_replay_save_up(IDirect3DDevice8 *device, liquid_depth_replay_t *replay)
+{
+    if (!replay->ready) return;
+    /* Draw*UP clears stream zero (and indexed UP clears the index binding).
+       Restore these before forwarding the original game draw. */
+    if (FAILED(IDirect3DDevice8_GetStreamSource(device, 0, &replay->stream, &replay->stride)) ||
+        FAILED(IDirect3DDevice8_GetIndices(device, &replay->indices, &replay->base_vertex))) {
+        if (replay->stream) IDirect3DVertexBuffer8_Release(replay->stream);
+        if (replay->indices) IDirect3DIndexBuffer8_Release(replay->indices);
+        liquid_native_replay_end(device, replay);
+        replay->ready = 0;
+        liquid_native_depth8_valid = 0;
+        return;
+    }
+    replay->user_memory = 1;
 }
 
 static HRESULT WINAPI liquid_native_Draw(IDirect3DDevice8 *d, D3DPRIMITIVETYPE t, UINT s, UINT c)
@@ -615,6 +724,7 @@ static HRESULT WINAPI liquid_native_DrawUP(IDirect3DDevice8 *d, D3DPRIMITIVETYPE
 {
     liquid_depth_replay_t r;
     liquid_native_replay_begin(d, &r);
+    liquid_native_replay_save_up(d, &r);
     if (r.ready) { if (FAILED(liquid_ndrawup(d, t, c, v, stride))) liquid_native_depth8_valid = 0; liquid_native_replay_end(d, &r); }
     return liquid_ndrawup(d, t, c, v, stride);
 }
@@ -623,6 +733,7 @@ static HRESULT WINAPI liquid_native_DrawIndexedUP(IDirect3DDevice8 *d, D3DPRIMIT
 {
     liquid_depth_replay_t r;
     liquid_native_replay_begin(d, &r);
+    liquid_native_replay_save_up(d, &r);
     if (r.ready) { if (FAILED(liquid_ndrawiup(d, t, m, n, c, idx, f, v, stride))) liquid_native_depth8_valid = 0; liquid_native_replay_end(d, &r); }
     return liquid_ndrawiup(d, t, m, n, c, idx, f, v, stride);
 }
@@ -649,35 +760,60 @@ static void liquid_native_d3d8_submit(IDirect3DDevice8 *device, int inside_scene
     DWORD state = 0;
     D3DVIEWPORT8 saved_viewport;
     UINT x, y;
-    RECT crop;
+    RECT crop, image_rect;
+    double started = 0, stamp = 0;
+    int stage = 0, success = 0;
     struct { float x,y,z,rhw,u,v; } quad[4];
     if (!liquid_native_allowed() || liquid_native.busy || !liquid_native_is_backbuffer8(device)) return;
+    InterlockedExchange(&liquid_renderer_tick, (LONG)GetTickCount());
     liquid_simulation_tick();
     if (!cfg.liquids_enabled || !liquid_has_active_particles() || !liquid_native_depth8_valid ||
-        device != liquid_native_device8 || !liquid_native.projection_valid ||
-        !liquid_native_ensure(liquid_native.viewport.Width, liquid_native.viewport.Height)) goto done;
+        device != liquid_native_device8 || !liquid_native.projection_valid) goto done;
+    started = stamp = liquid_native_clock_ms();
+    if (!liquid_native_ensure(liquid_native.viewport.Width, liquid_native.viewport.Height)) goto done;
     crop.left = liquid_native.viewport.X; crop.top = liquid_native.viewport.Y;
     crop.right = crop.left + liquid_native.width; crop.bottom = crop.top + liquid_native.height;
     if ((UINT)crop.right > liquid_native_depth8_width || (UINT)crop.bottom > liquid_native_depth8_height ||
         FAILED(IDirect3DSurface8_LockRect(liquid_native_depth8, &locked, &crop, D3DLOCK_READONLY))) goto done;
     for (y = 0; y < liquid_native.height; y++) {
         const BYTE *row = (BYTE*)locked.pBits + (size_t)y * locked.Pitch;
-        for (x = 0; x < liquid_native.width; x++)
-            liquid_native.depth[(size_t)y * liquid_native.width + x] =
-                liquid_native_depth8_format == (D3DFORMAT)82 ? ((const float*)row)[x] :
-                ((const unsigned short*)row)[x] / 65535.0f;
+        float *dst = liquid_native.depth + (size_t)y * liquid_native.width;
+        if (liquid_native_depth8_format == (D3DFORMAT)82)
+            memcpy(dst, row, liquid_native.width * sizeof(float));
+        else for (x = 0; x < liquid_native.width; x++)
+            dst[x] = ((const unsigned short*)row)[x] / 65535.0f;
     }
     IDirect3DSurface8_UnlockRect(liquid_native_depth8);
-    if (!liquid_native_composite(liquid_native_depth8_func)) goto done;
-    if (FAILED(IDirect3DDevice8_CreateTexture(device, liquid_native.width, liquid_native.height,
-        1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture))) goto done;
-    if (FAILED(IDirect3DTexture8_LockRect(texture, 0, &locked, NULL, 0))) goto cleanup;
-    for (y = 0; y < liquid_native.height; y++) {
-        DWORD *row = (DWORD*)((BYTE*)locked.pBits + (size_t)y * locked.Pitch);
-        const BYTE *src = liquid_native.rgba + (size_t)y * liquid_native.width * 4;
-        for (x = 0; x < liquid_native.width; x++) row[x] = D3DCOLOR_ARGB(src[x*4+3],src[x*4],src[x*4+1],src[x*4+2]);
+    liquid_native_perf_stage(stage++, &stamp);
+    liquid_native.crop_readback = 1;
+    success = liquid_native_composite(liquid_native_depth8_func);
+    liquid_native.crop_readback = 0;
+    if (!success) goto done;
+    liquid_native_perf_stage(stage++, &stamp);
+    image_rect = liquid_native.output_rect;
+    if (image_rect.right <= image_rect.left || image_rect.bottom <= image_rect.top) goto done;
+    if (started) liquid_native_perf.copied_pixels +=
+        (double)(image_rect.right - image_rect.left) * (image_rect.bottom - image_rect.top);
+    success = 0;
+    if (!liquid_native_texture8 || liquid_native_texture8_width != liquid_native.width ||
+        liquid_native_texture8_height != liquid_native.height) {
+        if (liquid_native_texture8) IDirect3DTexture8_Release(liquid_native_texture8);
+        liquid_native_texture8 = NULL;
+        if (FAILED(IDirect3DDevice8_CreateTexture(device, liquid_native.width, liquid_native.height,
+            1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &liquid_native_texture8))) goto done;
+        liquid_native_texture8_width = liquid_native.width;
+        liquid_native_texture8_height = liquid_native.height;
+    }
+    texture = liquid_native_texture8;
+    if (FAILED(IDirect3DTexture8_LockRect(texture, 0, &locked, &image_rect, 0))) goto cleanup;
+    for (y = image_rect.top; y < (UINT)image_rect.bottom; y++) {
+        DWORD *row = (DWORD*)((BYTE*)locked.pBits + (size_t)(y - image_rect.top) * locked.Pitch);
+        const BYTE *src = liquid_native.rgba + ((size_t)y * liquid_native.width + image_rect.left) * 4;
+        for (x = 0; x < (UINT)(image_rect.right - image_rect.left); x++)
+            row[x] = D3DCOLOR_ARGB(src[x*4+3],src[x*4],src[x*4+1],src[x*4+2]);
     }
     IDirect3DTexture8_UnlockRect(texture, 0);
+    liquid_native_perf_stage(stage++, &stamp);
     if (FAILED(IDirect3DDevice8_CreateStateBlock(device, D3DSBT_ALL, &state))) goto cleanup;
     if (FAILED(IDirect3DDevice8_GetViewport(device, &saved_viewport))) goto cleanup;
     if (!inside_scene && FAILED(IDirect3DDevice8_BeginScene(device))) goto cleanup;
@@ -711,20 +847,23 @@ static void liquid_native_d3d8_submit(IDirect3DDevice8 *device, int inside_scene
     IDirect3DDevice8_SetRenderState(device, D3DRS_BLENDOP, D3DBLENDOP_ADD);
     IDirect3DDevice8_SetRenderState(device, D3DRS_COLORWRITEENABLE, 7);
     for (x = 0; x < 4; x++) {
-        quad[x].u = (x & 1) ? 1 : 0; quad[x].v = (x & 2) ? 1 : 0;
-        quad[x].x = crop.left + quad[x].u * liquid_native.width - 0.5f;
-        quad[x].y = crop.top + quad[x].v * liquid_native.height - 0.5f;
+        float px = (float)((x & 1) ? image_rect.right : image_rect.left);
+        float py = (float)((x & 2) ? image_rect.bottom : image_rect.top);
+        quad[x].u = px / liquid_native.width; quad[x].v = py / liquid_native.height;
+        quad[x].x = crop.left + px - 0.5f;
+        quad[x].y = crop.top + py - 0.5f;
         quad[x].z = 0; quad[x].rhw = 1;
     }
-    IDirect3DDevice8_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
+    success = SUCCEEDED(IDirect3DDevice8_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0])));
     if (!inside_scene) IDirect3DDevice8_EndScene(device);
     IDirect3DDevice8_SetViewport(device, &saved_viewport);
     liquid_native.busy = 0;
     { static int logged; if (!logged++) log_line("native D3D8 shared liquid renderer active depth=separate-mirror format=%u shader=shared", liquid_native_depth8_format); }
 cleanup:
     if (state) { IDirect3DDevice8_ApplyStateBlock(device, state); IDirect3DDevice8_DeleteStateBlock(device, state); }
-    if (texture) IDirect3DTexture8_Release(texture);
 done:
+    liquid_native_perf_stage(stage, &stamp);
+    liquid_native_perf_report(started, success);
     liquid_native_depth8_valid = 0;
     liquid_native.projection_valid = 0;
 }

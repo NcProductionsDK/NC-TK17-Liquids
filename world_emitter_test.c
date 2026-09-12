@@ -159,6 +159,35 @@ int main(void)
     assert(liquid_emitter_transform(&emitter, position, direction));
     close_to(position[0], 10); close_to(position[1], 20.08f);
     close_to(position[2], 30); close_to(direction[1], 1);
+    /* Offsets follow the rotated tip frame, in metres independent of the
+       parent's nonuniform scale. Aim stays on the original joint chain. */
+    cfg.emitter_position[0] = 1;
+    assert(liquid_emitter_transform(&emitter, position, direction));
+    close_to(position[0], 10); close_to(position[1], 20.08f);
+    close_to(position[2], 29.99f); close_to(direction[1], 1);
+    cfg.emitter_position[0] = 0; cfg.emitter_position[1] = -1;
+    assert(liquid_emitter_transform(&emitter, position, direction));
+    close_to(position[0], 10.01f); close_to(position[1], 20.08f);
+    close_to(position[2], 30);
+    cfg.emitter_position[1] = 0; cfg.emitter_position[2] = 0.5f;
+    assert(liquid_emitter_transform(&emitter, position, direction));
+    close_to(position[1], 20.085f); close_to(direction[1], 1);
+    /* Local roll of the tip changes sideways/up adjustment, not forward. */
+    {
+        float *tm = (float*)((BYTE*)tip_source + 0x18);
+        tm[5] = 0; tm[6] = 1; tm[9] = -1; tm[10] = 0;
+        cfg.emitter_position[0] = 1; cfg.emitter_position[1] = 1;
+        cfg.emitter_position[2] = -1;
+        assert(liquid_emitter_transform(&emitter, position, direction));
+        close_to(position[0], 9.99f); close_to(position[1], 20.07f);
+        close_to(position[2], 30.01f); close_to(direction[1], 1);
+        tm[5] = tm[10] = 1; tm[6] = tm[9] = 0;
+    }
+    memset(cfg.emitter_position, 0, sizeof(cfg.emitter_position));
+    assert(liquid_emitter_transform(&emitter, position, direction));
+    close_to(position[0], 10); close_to(position[1], 20.08f);
+    close_to(position[2], 30);
+    puts("PASS: emitter offset axes/signs; 1 cm range independent of scale; tip roll; unchanged aim; zero restores original pivot");
     /* Camera invalid or moved/offscreen has no effect on a model source. */
     for (int i = 0; i < 16; ++i) captured_camera_inverse[i] = NAN;
     captured_camera_inverse_valid = 0;

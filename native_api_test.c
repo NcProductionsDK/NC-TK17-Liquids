@@ -231,6 +231,10 @@ static void test_d3d8(D3DMULTISAMPLE_TYPE samples)
 
 int main(void)
 {
+    /* Reproduce successful extension registration without a Hook5 renderer. */
+    hook5_present_registered = hook5_d3d11_scene_registered =
+        hook5_d3d11_composite_registered = 1;
+    CHECK(liquid_native_allowed());
     test_gl(); test_d3d8(D3DMULTISAMPLE_NONE); test_d3d8(D3DMULTISAMPLE_2_SAMPLES);
     return 0;
 }

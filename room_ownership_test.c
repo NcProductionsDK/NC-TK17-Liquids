@@ -101,6 +101,8 @@ static void test_native_confirmation(void)
 #endif
 
 static int probe_calls;
+static int probe_result;
+static int probe_exhaust_budget;
 static int THISCALL probe_model(void *self, const void *geometry, const float *origin,
     const float *direction, void *results, int hidden, unsigned int flags)
 {
@@ -109,13 +111,34 @@ static int THISCALL probe_model(void *self, const void *geometry, const float *o
     int axis;
     (void)self; (void)geometry; (void)hidden; (void)flags;
     probe_calls++;
+    if (probe_exhaust_budget && liquid_native_freeze_capture) {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        liquid_native_freeze_capture->probe_ticks += frequency.QuadPart;
+    }
     for (axis = 0; axis < 3; axis++) point[axis] = origin[axis] + t * direction[axis];
     /* The room droplet's ray sees a model four centimetres behind its impact. */
     if (point[0] > 0.03f) point[2] -= 0.04f;
     storage.count = 1;
     memcpy(storage.hit + 0x14, point, sizeof(point));
     *(void**)results = storage.hit;
-    return 0;
+    return probe_result;
+}
+
+static void test_failed_probe_stale_hit(void)
+{
+    void *results = NULL;
+    setup();
+    liquid_particles[0].contact_physx_person = 0;
+    liquid_particles[1].active = liquid_particles[2].active = 0;
+    tramp_AppPick_PickRay = probe_model;
+    probe_result = -1;
+    /* Failure with a leftover matching hit must never confer ownership. */
+    liquid_verify_recent_body_contacts(NULL,NULL,&results,0,0,42,GetTickCount());
+    CHECK(!liquid_particles[0].model_contact_verified);
+    probe_result = 0;
+    tramp_AppPick_PickRay = NULL;
+    puts("PASS: failed independent probe rejects stale matching hit data");
 }
 
 static void test_individual_verification(void)
@@ -150,6 +173,65 @@ static void test_individual_verification(void)
     puts("PASS: every recent body impact is independently checked without decals; room-behind-body rejection and bounded retries");
 }
 
+static void test_existing_ownership(void)
+{
+    liquid_native_contact_t contact = {0};
+    float hit[3] = {0,0,-1.04f}, gap;
+    setup();
+    contact.emission_id = 42; contact.particle_id = 1;
+    memcpy(contact.impact_world,liquid_particles[0].position,sizeof(hit));
+    CHECK(liquid_contact_attachment_outcome(&contact,hit,&gap) == LIQUID_ATTACHMENT_PHYSX);
+    CHECK(gap == -1 && !liquid_particles[0].model_contact_verified);
+    CHECK(!liquid_particles[0].model_contact_confirmed); /* No reattachment request. */
+    tick(); CHECK(liquid_particles[0].contact_person == 1);
+    CHECK(liquid_particles[0].position[2] == -1); /* No snap to clothing hit. */
+    contact.particle_id = 2;
+    memcpy(contact.impact_world,liquid_particles[1].position,sizeof(hit));
+    CHECK(liquid_contact_attachment_outcome(&contact,hit,&gap) == LIQUID_ATTACHMENT_GAP);
+    CHECK(gap > 0.04f && !liquid_particles[1].model_contact_verified);
+    liquid_particles[1].model_contact_verified = 1;
+    CHECK(liquid_contact_attachment_outcome(&contact,hit,&gap) == LIQUID_ATTACHMENT_VERIFIED);
+    CHECK(!liquid_particles[1].model_contact_confirmed);
+    liquid_particles[1].contact_physx_person = -1;
+    CHECK(liquid_contact_attachment_outcome(&contact,hit,&gap) == LIQUID_ATTACHMENT_ROOM);
+    contact.particle_id = 99;
+    CHECK(liquid_contact_attachment_outcome(&contact,hit,&gap) == LIQUID_ATTACHMENT_EXPIRED);
+    puts("PASS: PhysX/previous ownership is separate from exact mesh confirmation; no snap or repeated attachment; room and particle identity preserved");
+}
+
+static void test_shared_probe_budget(void)
+{
+    liquid_native_freeze_capture_t capture = {0};
+    void *results = NULL;
+    DWORD now = GetTickCount();
+    int i, total = 0;
+    setup();
+    for (i=0;i<3;i++) liquid_particles[i].contact_physx_person = 0;
+    liquid_native_freeze_capture = &capture;
+    tramp_AppPick_PickRay = probe_model;
+    probe_calls = 0; probe_result = -1; probe_exhaust_budget = 1;
+    liquid_verify_recent_body_contacts(NULL,NULL,&results,0,0,42,now);
+    CHECK(probe_calls == 1);
+    /* Another callback in the same native update shares the spent budget. */
+    liquid_verify_recent_body_contacts(NULL,NULL,&results,0,0,42,now);
+    CHECK(probe_calls == 1);
+    for (i=0;i<3;i++) total += liquid_particles[i].model_contact_probe_count;
+    CHECK(total == 1); /* Deferred particles don't lose a retry. */
+    for (i=1;i<12;i++) {
+        capture.probe_ticks = 0;
+        liquid_verify_recent_body_contacts(NULL,NULL,&results,0,0,42,now+i*16);
+    }
+    CHECK(probe_calls == 9);
+    for (i=0;i<3;i++) {
+        CHECK(liquid_particles[i].model_contact_probe_count == 3);
+        CHECK(!liquid_particles[i].model_contact_verified);
+    }
+    liquid_native_freeze_capture = NULL;
+    tramp_AppPick_PickRay = NULL;
+    probe_exhaust_budget = probe_result = 0;
+    puts("PASS: shared probe time budget; no lost retries; eventual fair coverage; stale hits stay rejected");
+}
+
 int main(void)
 {
     InitializeCriticalSection(&log_lock); InitializeCriticalSection(&contact_lock);
@@ -157,6 +239,9 @@ int main(void)
 #ifndef LIQUID_BASELINE
     test_native_confirmation();
     test_individual_verification();
+    test_failed_probe_stale_hit();
+    test_existing_ownership();
+    test_shared_probe_budget();
 #endif
     DeleteCriticalSection(&contact_lock); DeleteCriticalSection(&log_lock);
     return 0;

@@ -55,7 +55,56 @@ static void test_compositor(void)
     CHECK(alpha_sum() == 0);
     CHECK(liquid_native_ensure(64, 96));
     CHECK(liquid_native.width == 64 && liquid_native.height == 96);
+    liquid_native.viewport.Width = 64; liquid_native.viewport.Height = 96;
+    /* Alternating depth must replace the prior frame's data, also after resize. */
+    for (i = 0; i < 32; i++) {
+        unsigned int j;
+        for (j = 0; j < 64 * 96; j++) liquid_native.depth[j] = (i & 1) ? 0.5f : 0;
+        CHECK(liquid_native_composite(D3D11_COMPARISON_GREATER_EQUAL));
+        CHECK((alpha_sum() == 0) == (i & 1));
+    }
+    CHECK(!liquid_native_composite((D3D11_COMPARISON_FUNC)0));
+    CHECK(!liquid_native_composite((D3D11_COMPARISON_FUNC)9));
+    liquid_native_release_targets();
+    CHECK(!liquid_native.target && !liquid_native.readback && !liquid_native.depth);
+    CHECK(liquid_native_ensure(128, 128));
+    liquid_native.viewport.Width = liquid_native.viewport.Height = 128;
+    for (i = 0; i < 128 * 128; i++) liquid_native.depth[i] = 0;
+    CHECK(liquid_native_composite(D3D11_COMPARISON_GREATER_EQUAL));
+    CHECK(alpha_sum() > 0);
     puts("PASS: shared native compositor renders; normal/reversed scene depth occludes; Hook5 blend preserved; resize");
+}
+
+static void test_cropped_readback(void)
+{
+    BYTE reference[128 * 128 * 4];
+    int frame, x, y;
+    setup_liquid(); CHECK(liquid_native_ensure(128, 128));
+    for (y = 0; y < 128 * 128; y++) liquid_native.depth[y] = 1;
+    for (frame = 0; frame < 7; frame++) {
+        RECT r;
+        liquid_particles[0].position[0] = (frame - 3) * 0.4f;
+        liquid_native.crop_readback = 0;
+        CHECK(liquid_native_composite(D3D11_COMPARISON_LESS_EQUAL));
+        memcpy(reference, liquid_native.rgba, sizeof(reference));
+        /* Poison untouched memory: cropped output must never display it. */
+        memset(liquid_native.rgba, 0xcc, sizeof(reference));
+        liquid_native.crop_readback = 1;
+        CHECK(liquid_native_composite(D3D11_COMPARISON_LESS_EQUAL));
+        r = liquid_native.output_rect;
+        CHECK(r.left >= 0 && r.top >= 0 && r.right <= 128 && r.bottom <= 128);
+        for (y = 0; y < 128; y++) for (x = 0; x < 128; x++) {
+            int offset = (y * 128 + x) * 4;
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+                CHECK(!memcmp(reference + offset, liquid_native.rgba + offset, 4));
+            else CHECK(reference[offset + 3] == 0);
+        }
+    }
+    liquid_particles[0].active = 0;
+    CHECK(liquid_native_composite(D3D11_COMPARISON_LESS_EQUAL));
+    CHECK(liquid_native.output_rect.right == 0 && liquid_native.output_rect.bottom == 0);
+    liquid_native.crop_readback = 0;
+    puts("PASS: cropped readback matches full image pixel-for-pixel across screen edges and movement; no stale pixels or empty-frame overlay");
 }
 
 int main(void)
@@ -68,6 +117,9 @@ int main(void)
     CHECK(offsetof(IDirect3DDevice8Vtbl, DrawPrimitiveUP) / sizeof(void*) == 72);
     CHECK(offsetof(IDirect3DDevice8Vtbl, DrawIndexedPrimitiveUP) / sizeof(void*) == 73);
     hook5_d3d11_scene_registered = 1;
+    hook5_present_registered = 1;
+    CHECK(liquid_native_allowed()); /* Installed extension is not a renderer. */
+    hook5_frame_seen = 1;
     CHECK(!liquid_native_allowed());
     /* NULL deliberately verifies that the Hook5 guard precedes API access. */
     liquid_native_gl_frame(); liquid_native_d3d8_frame(NULL);
@@ -76,7 +128,9 @@ int main(void)
     CHECK(!liquid_native_allowed());
     liquid_native_gl_frame(); liquid_native_d3d8_frame(NULL);
     hook5_present_registered = 0;
-    puts("PASS: Hook5 registration bypasses all native rendering and depth replay");
+    hook5_frame_seen = 0;
+    puts("PASS: registration alone permits native rendering; active Hook5 bypasses native rendering and depth replay");
     test_compositor();
+    test_cropped_readback();
     return 0;
 }

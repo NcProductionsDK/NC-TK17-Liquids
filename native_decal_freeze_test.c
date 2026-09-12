@@ -138,10 +138,35 @@ static void test_real_engine_setter(void)
     _aligned_free(consumer); FreeLibrary(sys);
 }
 
+static void test_retry_outcomes(void)
+{
+    liquid_native_contact_t contact = {0};
+    DWORD now = GetTickCount();
+    liquid_particle_t *particle = &liquid_particles[0];
+    memset(liquid_native_contacts,0,sizeof(liquid_native_contacts));
+    memset(particle,0,sizeof(*particle));
+    cfg.particle_limit = 1;
+    particle->active = particle->collided = 1;
+    particle->emission_id = contact.emission_id = 42;
+    particle->spawn_order = contact.particle_id = 1;
+    contact.tick = now;
+    model_emitters[0].emission_id = 42;
+    model_emitters[0].end_tick = now + 1000;
+    /* Logged result=12/count=1/body_confirmed=0 must not spawn retries. */
+    CHECK(!liquid_native_retry_stain_miss(&contact,now,1,12,1));
+    CHECK(!liquid_native_contacts[0].state && !particle->model_contact_verified);
+    CHECK(liquid_native_retry_stain_miss(&contact,now,1,-1,0));
+    CHECK(liquid_native_contacts[0].state == 1);
+    CHECK(liquid_native_contacts[0].retry_count == 1);
+    memset(liquid_native_contacts,0,sizeof(liquid_native_contacts));
+    memset(model_emitters,0,sizeof(model_emitters));
+}
+
 int main(void)
 {
     int calls;
     init_fixture();
+    test_retry_outcomes();
     test_real_engine_setter();
     tramp_NativeStainUpdate = fake_native_update;
     hook_NativeStainUpdate(update, NULL, NULL, NULL);
