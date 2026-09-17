@@ -883,14 +883,31 @@ static int ptr_writable(const void *pointer, size_t bytes)
 
 static int safe_cstr_a(const char *text, size_t max_len)
 {
-    size_t i;
+    size_t i = 0;
     if (!text) return 0;
-    for (i = 0; i < max_len; i++) {
-        unsigned char ch;
-        if (!ptr_readable(text + i, 1)) return 0;
-        ch = (unsigned char)text[i];
-        if (!ch) return i > 0;
-        if (ch < 32 || ch > 126) return 0;
+    /* Object names arrive in bursts when the Key Editor scrolls. Validate
+       each region once for this scan, rather than calling VirtualQuery for
+       every character. Never read into the next region without checking it,
+       and do not retain permissions across calls or frames. */
+    while (i < max_len) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t address = (uintptr_t)text + i;
+        uintptr_t region_end;
+        size_t available, stop;
+        if (address < (uintptr_t)text ||
+            !VirtualQuery((const void*)address, &mbi, sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+        region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= address) return 0;
+        available = region_end - address;
+        if (available > max_len - i) available = max_len - i;
+        stop = i + available;
+        for (; i < stop; i++) {
+            unsigned char ch = (unsigned char)text[i];
+            if (!ch) return i > 0;
+            if (ch < 32 || ch > 126) return 0;
+        }
     }
     return 0;
 }
@@ -1875,13 +1892,16 @@ static const char *known_object_name(const void *object)
 
 static int liquid_person_spermray_root_name(const char *name)
 {
+    /* This also sees unrelated UI names through Object::iNameSet. The four
+       accepted names are fixed; do not format them on every lookup. */
+    static const char *const roots[] = {
+        "Person01Spermray", "Person02Spermray",
+        "Person03Spermray", "Person04Spermray"
+    };
     int person;
-    char expected[32];
     if (!name) return 0;
     for (person = 1; person <= 4; person++) {
-        _snprintf(expected, sizeof(expected), "Person%02dSpermray", person);
-        expected[sizeof(expected) - 1] = 0;
-        if (_stricmp(name, expected) == 0) return person;
+        if (_stricmp(name, roots[person - 1]) == 0) return person;
     }
     return 0;
 }
