@@ -1,5 +1,269 @@
 # NC-TK17-Liquids
 
+## Room decal extraction cost (0.8.43)
+
+The 0.8.42 user-confirmed camera fix is retained. Its session log showed native
+update peaks around 23-29 ms and one 172.266 ms peak. Inspection found six
+VirtualQuery-backed validations per candidate room triangle, followed by exact
+closest-point math even for triangles far from the impact.
+
+Validation now covers the extraction frame, sphere and entire position array
+once per buffer during that synchronous extraction. Source/frame identity,
+array count, index bounds and first-vertex identity remain checked on each
+call. Caches are scoped to the update, reset at each accepted room pick and
+at extraction completion; pointer/count changes trigger fresh validation.
+A conservative expanded triangle bounding box rejects distant candidates
+before exact distance calculation. No radius, rate, decal budget or config
+setting was changed.
+
+The executed-bridge benchmark (20,000 triangles, five runs) drops from median
+188.477 ms / 120,000 memory queries to 3.103 ms / 4 queries, selecting the same
+20 intersecting triangles. This is a synthetic extraction benchmark, not a
+measured gameplay frame-rate improvement. Regression also compares 30,000
+triangle cases against the previous exact rule and exercises a guarded array,
+selection boundaries and all three native ABI bridges.
+
+Diagnostic-enabled slow updates (8 ms or more, at most one detailed report per
+second) now separate body/verification picks, room picks, post-pick extraction,
+clipping and remaining native work, with triangle/rejection counts. No clocks
+or log writes were added per triangle. The existing summary remains available.
+Gameplay in the same room is needed to establish the remaining stall profile.
+
+## Native POV camera-look placement (0.8.42)
+
+The left-button input guard in 0.8.41 did not resolve the reported gameplay
+reset. Its log shows held custom aim while the visible tool tip repeatedly
+returns to the centered native position. TK17 has a separate mode-3 branch
+at EXE+6FFE3 which zeros native channel coordinates before tool placement.
+
+A signature-checked hook at EXE+6FFF4 retains the last free native channel
+coordinates for the active custom POV descriptor and restores them after
+that mode-3 reset. It leaves the native placement calculation, right-button
+path and camera input intact. Native mode 3 also holds the custom stream's
+screen target when OS button callbacks are absent. Native channel coordinates
+and screen NDC are deliberately cached separately. New emissions, disabled
+POV, lost free-cursor state and invalid descriptors invalidate the native cache;
+a sequence starting in camera mode without a free sample keeps native behavior.
+Diagnostics record at most 64 camera-mode transitions per session.
+
+Regression executes the shipped EXE's original centering instructions and
+the new hook bridge, checking placement locals, x87 state, stolen instructions,
+release, the existing right-button path and cache invalidation. Left-button camera movement was confirmed working in game on 0.8.42.
+
+## POV left-button camera look (0.8.41)
+
+POV aim now retains its last free crosshair screen position during left-button
+camera look as well as right-button orbit. Both the early physical-button
+check and window messages cover both buttons. Independent held-button bits
+keep overlapping presses from releasing aim early; capture/focus loss and
+POV cancellation retain their existing reset behavior. No config changes.
+
+The 0.8.40 room decal appearance was confirmed in game. Its session log shows
+successful bounded clipping and creation, and clean shutdown. Native update/
+picking timing occasionally peaks near 100 ms; that remains a performance
+observation, not an established cause in the decal clipping code.
+
+## Bounded room decal geometry (0.8.40)
+
+0.8.39 gameplay confirmed native room meshes are created, but revealed repeated
+texture over entire floor faces. Triangle selection alone leaves the whole
+source face in each decal and relies on texture addressing to hide the outside.
+The room path now clips each newly generated static decal to its primary
+projected UV tile (0..1) before the native caller assigns its material/cache.
+Positions, normals and supported float vertex streams are interpolated using
+barycentric weights; the original room mesh remains untouched.
+
+The hook checks the native frame and exact accepted source, so body/native
+unrelated projection is unchanged. Work is bounded to 32,768 output vertices
+and eight streams. Invalid/unsupported static output is made empty, and room
+creation is disabled if the clip hook cannot install. No config changes.
+
+The new regression executes the native hook bytes and bridge, checks x87 state,
+and uses the shipped SYS DLL's array allocation/free routines with fixture
+property dispatch. It verifies a large triangle becomes a one-tile patch,
+interpolation, winding/area, source isolation and invalid-output suppression.
+In-game appearance was confirmed by the user after this fix. Clear previously created
+room stains or reload the scene when testing: existing geometry is not rewritten.
+
+## Room triangle selection (0.8.39)
+
+The 0.8.38 gameplay log confirms close room picks now succeed. Native decal
+extraction, however, selects a triangle only when one of its vertices falls
+within the decal sphere. A floor/wall triangle can contain the impact while
+all three vertices fall outside, leaving no geometry to project.
+
+For the verified room mesh and current native update only, three signature
+checked distance-call sites now include triangles whose surface intersects the
+existing selection sphere. Native projection, UV scale, texture, radius and
+ownership are retained. Body/vanilla calls keep their original vertex-distance
+behavior. Tests execute the patched calls for all three native loop layouts,
+including disabled/body fallback and live x87 stack preservation.
+
+Static decals can have geometry nodes without animation controls. Room budget
+and creation reports now count the larger of those two arrays per group;
+the same 256-object ceiling therefore covers static decals. The report also
+counts triangles recovered by the new selection check. This correction still
+requires floor/wall appearance and clearing confirmation in the game.
+
+## Room picker string argument correction (0.8.38)
+
+The enabled 0.8.37 gameplay session queued room contacts but every logged room
+query returned no hit. The prototype passed `&room_list` to PickRay instead of
+the constructed `room_list` value required by Bionic StringRef. The native EXE
+call sites and SYS String-to-StringRef conversion confirm the extra indirection
+was wrong. The room query now passes the correct value, with the original
+string lifetime and surface validation retained. A regression uses the actual
+SYS DLL's string construction/conversion/accessor, alongside room routing tests.
+Successful in-game room mesh creation and appearance still need confirmation.
+
+The 0.8.37 room-setting initialization guard is removed at the user's request:
+the in-game option's synchronization was intentional. Startup, rebuild and menu
+room values again sync normally; the existing POV-specific guard is unchanged.
+The installed Config.ini is not changed by this correction.
+
+## Native room stains prototype (0.8.36)
+
+`[liquid_collision] spawn_room_stains` enables native stains on verified room
+polygon contacts from person and POV liquid. The option defaults off for new
+configs and is exposed as **Room Stains (Prototype)** in the settings addon.
+The development installation enables it for the first gameplay test.
+
+Confirmed room contacts use the `Room|PoseEditRoom` picker lists. Unclassified
+depth contacts try the existing body path first, then the room path if no body
+hit matches the actual impact. Room picks must be within 0.015 world units of
+the impact, agree with its surface normal, and identify a polygon mesh supported
+by the native projector. Body attachment flags are never set for room hits.
+Collision normals are stored before publishing the contact to the game thread.
+
+The prototype reuses native stain projection/materials and the existing
+`native_decal_drip` setting. Room requests share `model_stain_rate` and have an
+additional global ceiling of ten accepted picks per second. New room picks
+pause when the current native update contains 256 stain objects; clearing
+native stains releases this budget. This counts body objects as well, but
+does not cap creation of body stains. No separate persistent mesh cache is added.
+CleanUp drops pending room requests and retains the existing POV cancellation.
+Created decals use the native engine's normal clear and ownership mechanisms.
+
+Start validation on a static floor/wall. Actual native mesh creation, Hook5
+appearance, clearing and room reload behavior need gameplay confirmation;
+moving props and all addon mesh variants are not yet validated. Bounded log
+messages distinguish rejected/accepted picks and native control counts before
+and after creation. Regression fixtures cover the room routing and guardrails,
+actual depth-collision queue ordering, POV dispatch, and independent settings.
+
+## Confirmed camera fix cleanup (0.8.35)
+
+The user confirmed that scene camera synchronization fixes the landed-liquid
+camera-tilt issue. The 0.8.34 runtime log also records native/scene camera
+differences during motion. Temporary per-frame camera-difference calculations
+and repeated diagnostic messages are removed; a single startup confirmation
+remains. Matrix validation, depth-frame pairing and all rendering behavior are
+unchanged. This is a small overhead reduction, not a measured FPS improvement.
+
+## Hook5 scene camera synchronization (0.8.34)
+
+Depth collisions and liquid rendering now use a camera snapshot taken from
+Hook5 when its scene depth is captured. The snapshot is paired with that
+depth view through final composition and discarded at Present. Previously,
+projection came from Hook5 while camera position/rotation came from the
+independently updated AppTracker callback. Mismatched camera updates can
+project stationary contact footprints underneath their surfaces during motion.
+
+This uses the optional `nc_hook5_extended_get_view_matrix` ABI 1 export added
+to Hook5-Extended. The export verifies the supported Hook5 binary layout;
+Liquids accepts only finite rigid affine camera matrices. Missing/invalid
+camera data or a mismatched depth view retains the previous camera fallback.
+The native POV aim camera and the approved final-scene FOV logic are unchanged.
+No settings or physical contact/attachment positions are changed.
+
+`camera_sync_test.c` covers 60 tilt/translation cases with normal/reverse depth,
+rejects stale/invalid camera data, and verifies the native camera is untouched.
+The old path buries vertices in this deliberate camera-mismatch fixture;
+the synchronized path stays on the floor. The subsequent in-game test confirmed
+the fix, and temporary diagnostics recorded native/scene differences. The
+regression remains available; 0.8.35 removes those temporary diagnostics.
+
+## Landed contact depth and POV FOV alignment (0.8.33)
+
+Landed droplet footprints and connecting necks now use their contact surface
+plane for vertex depth. Previously the flat billboard depth put part of a
+footprint below a floor as the camera tilted. The correction retains screen
+shape and opacity, adds only a 0.0005-unit outward render offset, and keeps
+normal scene depth testing. Collision and attachment positions do not move.
+Attached surface normals rotate with the existing body/segment attachment.
+Unavailable normals or degenerate projected planes retain the old fallback.
+
+POV aiming uses the projection captured at the final Hook5 scene composition,
+with the ratio of captured/live FOV applied once if FOV changes before the
+next simulation. This avoids relying on a differently scaled projection in
+an earlier render phase. The cache expires after 250 ms; startup/stalled
+composition uses the existing projection fallback. Per-pulse diagnostics
+record the selected projection source, live FOV and the projection scales.
+
+The surface regression covers 15-85 degree camera tilt, both depth orders,
+and rotating body/segment normals. A separate regression deliberately
+supplies different early/final matrices and covers FOV 0.1 through 8, live
+changes, ultrawide output and gravity/drag flight to the crosshair. The old
+code fails both fixtures. These tests demonstrate the corrected failure
+modes; they do not establish that projection phase mismatch was the cause
+of the user's FOV symptom. The user confirmed the FOV correction works, but
+reported the landed room camera-tilt issue still occurred after this version.
+Existing settings, fixed reach, launch physics and native tool motion remain
+unchanged. No Hook5 or Hook5-Extended files are changed.
+
+## Camera-distance contact correction (0.8.32)
+
+The shared depth collision path now caps `depth_tolerance` to the projected
+equivalent of 0.002 camera units. A fixed depth-buffer allowance previously
+required increasingly deep penetration as the camera moved away. Detection
+could then fail entirely or the world-space surface guard would reject the
+delayed crossing. The cap uses the captured projection for every comparison
+in the sweep, including reverse-depth rendering. Existing world-space
+validation and camera-independent PhysX body queries are unchanged.
+
+The regression holds the impact fixed and moves only the camera. The old
+code missed crossings from 2 units onward at tolerance 0.00015. The corrected
+code passes at 1, 2, 5, 10, 25 and 50 units for both emitter sources, normal
+and reversed D24, and tolerances 0.00015, 0.0015 and 0.05. Pre-impact particles,
+foreground silhouettes and empty depth still produce no collision. These are
+synthetic production-path tests; the reported gameplay symptom awaits user
+confirmation. No live configuration values or launch physics are changed.
+
+## POV tool liquids (0.8.31)
+
+Custom POV liquids and camera-orbit aiming were confirmed working in game by
+the user on 2026-09-22 with 0.8.30. This cleanup retains that behavior:
+
+- `[liquids] pov_enabled = true` replaces the X-key tool effect with custom
+  liquids using the same visuals, pulse settings and contact system as the
+  person emitters. The default is false, which keeps native POV behavior.
+- `pov_reach` sets a fixed aiming plane ahead of the camera: 0.5 to 10 game
+  units, default 2.5. It is not a maximum particle travel distance. Launch
+  compensates for gravity and drag; move closer if the chosen reach is too short.
+- The native tool follows the mouse throughout the pulse sequence and remaining
+  flight. Liquid launches from its visible tip toward the crosshair. While
+  looking around with left mouse held or orbiting with right mouse held, aim
+  retains the last free crosshair screen position and follows the moving camera. Releasing camera control resumes
+  live cursor tracking.
+- Body decals require liquid contact. Hovering the crosshair alone creates none.
+- Shift+X clears decals and cancels the active POV sequence, including its
+  particles, queued contacts and pulse audio.
+- The ordinary mouse pointer hides while the custom tool is active in the game
+  client area and restores afterward, on cancellation, or when focus changes.
+
+The cleanup skips redundant foreground-window queries when right mouse is up,
+avoids descriptor validation with no custom sequence, shares native descriptor
+completion between cancellation and normal finish, and removes temporary
+cursor/gesture logs. Contact diagnostics are sampled at most once per second
+per emission; contact processing and per-pulse aim diagnostics remain active.
+No configuration values or launch calculations were changed.
+
+Build with `compile-liquids.bat` (32-bit MinGW GCC). The POV regression suites
+are `pov_cursor_test`, `pov_qol_test`, `pov_emitter_test`, `pov_contact_test` and
+`pov_settings_test`; each includes the production source and links with `-lole32`.
+Run tests from a scratch directory because some create temporary INI/log files.
+[POV implementation history](POV_HISTORY.md) preserves the intermediate fixes.
+
 ## Native D3D8 rendering cost (0.8.17, pending gameplay verification)
 
 The 0.8.16 gameplay tests confirm liquid renders in both native D3D8 and Hook5.

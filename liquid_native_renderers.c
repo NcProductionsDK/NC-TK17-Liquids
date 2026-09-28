@@ -116,7 +116,7 @@ static void liquid_native_snapshot(liquid_depth_snapshot_t *snapshot)
     for (i = 0; i < cfg.particle_limit; i++) {
         const liquid_particle_t *p = &liquid_particles[i];
         liquid_depth_particle_sample_t *s = &snapshot->particles[i];
-        if (!p->active || p->collided || p->source_kind != 1) continue;
+        if (!p->active || p->collided || !liquid_shared_source(p->source_kind)) continue;
         s->valid = 1; s->spawn_order = p->spawn_order; s->emission_id = p->emission_id;
         s->age = p->age; s->has_last_visible = p->has_last_visible;
         memcpy(s->position, p->position, sizeof(s->position));

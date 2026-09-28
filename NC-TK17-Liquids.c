@@ -24,7 +24,7 @@
 #define THISCALL __thiscall
 #endif
 
-#define LIQUIDS_VERSION "0.8.17-native-render-cost"
+#define LIQUIDS_VERSION "0.8.43-room-perf"
 #define LIQUID_EMITTER_OFFSET_METRES 0.01f
 #define TK17_EXE_TIMESTAMP 0x56EF69A0u
 #define TK17_EXE_IMAGE_SIZE 0x00312000u
@@ -144,7 +144,8 @@ typedef struct liquids_config_t {
     float model_pulse_decay;
     float model_stream_cohesion;
     float model_satellite_chance;
-    float tool_duration;
+    int pov_enabled;
+    float pov_reach;
     float tool_start_delay;
     float emitter_position[3];
     int testicular_retraction_enabled;
@@ -183,6 +184,7 @@ typedef struct liquids_config_t {
     float collision_connection_distance;
     float collision_connection_thickness;
     int collision_spawn_model_stains;
+    int collision_spawn_room_stains;
     float collision_model_stain_rate;
     int collision_native_decal_drip;
     char ejaculation_sound_preset[128];
@@ -229,12 +231,14 @@ static liquid_setting_binding_t liquid_setting_bindings[] = {
     { "NcLiquidsContactDropletConnectionThickness", "liquid_contact_droplets", "connection_thickness", LIQUID_SETTING_FLOAT, NULL },
     { "NcLiquidsParticleLimit", "liquids", "particle_limit", LIQUID_SETTING_INT, NULL },
     { "NcLiquidsStreamQuality", "liquid_visuals", "stream_curve_smoothness", LIQUID_SETTING_INT, NULL },
+    { "NcLiquidsPovEnabled", "liquids", "pov_enabled", LIQUID_SETTING_BOOL, NULL },
     { "NcLiquidsPulseCount", "liquids", "model_pulse_count", LIQUID_SETTING_INT, NULL },
     { "NcLiquidsPulseDuration", "liquids", "model_pulse_duration", LIQUID_SETTING_FLOAT, NULL },
     { "NcLiquidsPulseInterval", "liquids", "model_pulse_interval", LIQUID_SETTING_FLOAT, NULL },
     { "NcLiquidsPulseDecay", "liquids", "model_pulse_decay", LIQUID_SETTING_FLOAT, NULL },
     { "NcLiquidsCollisionEnabled", "liquid_collision", "enabled", LIQUID_SETTING_BOOL, NULL },
     { "NcLiquidsBodyStains", "liquid_collision", "spawn_model_stains", LIQUID_SETTING_BOOL, NULL },
+    { "NcLiquidsRoomStains", "liquid_collision", "spawn_room_stains", LIQUID_SETTING_BOOL, NULL },
     { "NcLiquidsAnimatedStains", "liquid_collision", "native_decal_drip", LIQUID_SETTING_BOOL, NULL },
     { "NcLiquidsStainAmount", "liquid_collision", "model_stain_rate", LIQUID_SETTING_FLOAT, NULL },
     { "NcLiquidsTesticularRetractionEnabled", "testicular_retraction", "enabled", LIQUID_SETTING_BOOL, NULL },
@@ -297,6 +301,8 @@ typedef struct liquid_native_contact_t {
     unsigned int emission_id;
     unsigned int particle_id;
     unsigned int retry_count;
+    int target_kind; /* 0=body path, 1=room only, 2=unclassified: body then room */
+    float normal_world[3];
     float impact_world[3];
     float origin_world[3];
     float direction_world[3];
@@ -322,6 +328,18 @@ typedef struct liquid_native_freeze_capture_t {
     int attachment_outcome;
     float attachment_gap;
     LONGLONG probe_ticks;
+    int room_picks;
+    int room_objects_before;
+    void *room_projection_target;
+    void *room_projection_frame;
+    unsigned int room_triangles_recovered;
+    /* Valid only within one synchronous room mesh extraction. */
+    const void *room_checked_frame, *room_checked_sphere, *room_checked_positions;
+    int room_checked_position_count;
+    unsigned int room_triangles_tested, room_triangles_distant;
+    LONGLONG body_pick_ticks, room_pick_ticks, room_extract_ticks, room_clip_ticks;
+    LONGLONG room_extract_start;
+    unsigned int body_pick_calls, room_pick_calls;
 } liquid_native_freeze_capture_t;
 
 typedef struct liquid_spermray_source_person_t {
@@ -374,10 +392,13 @@ typedef struct liquid_particle_t {
     float contact_segment_t;
     DWORD contact_attached_tick;
     volatile LONG model_contact_confirmed;
+    volatile LONG room_contact_verified;
     volatile LONG model_contact_verified;
     DWORD model_contact_probe_tick;
     unsigned int model_contact_probe_count;
     float contact_local_offset[3];
+    float contact_local_normal[3];
+    int contact_local_normal_valid;
     float contact_anchor_world[3];
     float last_visible[3];
     int has_last_visible;
@@ -611,6 +632,8 @@ static volatile LONG hook5_scene_drawn_since_present;
 static volatile LONG hook5_composite_drawn_since_present;
 static __thread int hook_recursion;
 static __thread int liquid_setting_sync_depth;
+static __thread int liquid_pov_settings_build_depth;
+static int liquid_pov_control_ready;
 static named_object_t named_objects[NAMED_OBJECT_SLOTS];
 static liquid_transform_node_t
     liquid_transform_nodes[LIQUID_TRANSFORM_NODE_SLOTS];
@@ -634,8 +657,16 @@ static unsigned int liquid_recent_native_ray_node_count;
 static void *liquid_hidden_native_ray_nodes[
     LIQUID_HIDDEN_NATIVE_RAY_NODES];
 static unsigned int liquid_hidden_native_ray_node_count;
+static void *liquid_tool_ray_nodes[LIQUID_HIDDEN_NATIVE_RAY_NODES];
+static unsigned int liquid_tool_ray_node_count;
+static int liquid_tool_ray_hidden;
 static DWORD liquid_last_tick;
 static DWORD last_tool_command_tick;
+static void liquid_pov_cancel(void);
+static void liquid_room_clear_pending(void);
+static void liquid_pov_cursor_tick(void);
+static void liquid_pov_restore_pointer(void);
+static void liquid_pov_release_pointer(void);
 static DWORD liquid_config_check_tick;
 static FILETIME liquid_config_write_time;
 static int liquid_config_write_time_valid;
@@ -672,19 +703,26 @@ static unsigned int liquid_native_frozen_control_limit;
 static volatile void *liquid_native_stain_descriptor;
 static volatile LONG liquid_native_stain_descriptor_emission;
 static volatile LONG liquid_native_last_contact_queue_tick[
-    LIQUID_MODEL_EMITTER_COUNT];
+    LIQUID_MODEL_EMITTER_COUNT + 1];
 static volatile LONG liquid_latest_model_emission;
 static unsigned int liquid_emission_serial;
 static unsigned int liquid_particle_serial;
 static volatile void *latest_spermray_group_object;
 static volatile void *latest_spermray_splash_source_object;
 static volatile void *tool_spermray_group_object;
+static void *latest_tool_mesh_object, *tool_mesh_object;
 static volatile void *tool_spermray_root_object;
 static liquid_spermray_source_person_t
     liquid_spermray_source_people[LIQUID_SPERMRAY_SOURCE_SLOTS];
 static unsigned int liquid_random_state = 0x4e43584cu;
 static float captured_camera_inverse[16];
 static volatile LONG captured_camera_inverse_valid;
+/* Scoped to depth readback and rendering; native POV aiming keeps the live
+   AppTracker camera. This snapshot belongs to the retained Hook5 scene depth. */
+static const float *liquid_scene_camera_override;
+static float liquid_hook5_scene_camera_inverse[16];
+static ID3D11DepthStencilView *liquid_hook5_scene_camera_depth;
+static int liquid_hook5_scene_camera_valid;
 static D3DMATRIX captured_d3d_projection;
 static D3DVIEWPORT8 captured_d3d_viewport;
 static volatile LONG captured_d3d_projection_valid;
@@ -750,6 +788,7 @@ static hook5_register_present_callback_t
     hook5_register_composite_callback;
 static hook5_get_fov_multiplier_t hook5_get_fov_multiplier;
 static hook5_get_projection_matrix_t hook5_get_projection_matrix;
+static hook5_get_projection_matrix_t hook5_get_view_matrix;
 static IDirect3DDevice8 *liquid_d3d8_texture_device;
 static IDirect3DTexture8 *liquid_d3d8_stream_texture;
 static ID3D11Device *liquid_d3d11_device;
@@ -1009,11 +1048,30 @@ static int liquid_classify_recent_native_ray_nodes(int tool_owned)
 {
     unsigned int i;
     int changed = 0;
+    int visible = tool_owned && !cfg.pov_enabled;
+    if (tool_owned && liquid_recent_native_ray_node_count)
+        liquid_tool_ray_hidden = !visible;
     for (i = 0; i < liquid_recent_native_ray_node_count; ++i) {
         void *object = liquid_recent_native_ray_nodes[i];
         if (object) {
             changed += liquid_set_script_visibility(
-                object, tool_owned ? 1u : 0u);
+                object, visible ? 1u : 0u);
+            /* Tool hierarchies are reused across X presses. Remember them
+               even while native POV is selected, for a later live enable. */
+            if (tool_owned) {
+                unsigned int j;
+                for (j = 0; j < liquid_tool_ray_node_count; ++j)
+                    if (liquid_tool_ray_nodes[j] == object) break;
+                if (j == liquid_tool_ray_node_count) {
+                    if (j == LIQUID_HIDDEN_NATIVE_RAY_NODES) {
+                        memmove(liquid_tool_ray_nodes,
+                            liquid_tool_ray_nodes + 1,
+                            sizeof(void*) * (LIQUID_HIDDEN_NATIVE_RAY_NODES - 1));
+                        --liquid_tool_ray_node_count;
+                    }
+                    liquid_tool_ray_nodes[liquid_tool_ray_node_count++] = object;
+                }
+            }
             if (!tool_owned)
                 liquid_remember_hidden_native_ray_node(object);
         }
@@ -1027,10 +1085,27 @@ static int liquid_classify_recent_native_ray_nodes(int tool_owned)
    have already been hidden. Restore only nodes hidden by this plugin, plus
    any provisional nodes still waiting for owner classification. Subsequent
    visibility changes are left entirely to TK17's native scheduler. */
-static int liquid_restore_native_ray_nodes(void)
+static int liquid_set_tool_ray_visibility(unsigned int visible)
 {
     unsigned int i;
     int changed = 0;
+    for (i = 0; i < liquid_tool_ray_node_count; ++i)
+        changed += liquid_set_script_visibility(liquid_tool_ray_nodes[i], visible);
+    liquid_tool_ray_hidden = !visible;
+    return changed;
+}
+
+static int liquid_restore_tool_ray_nodes(void)
+{
+    /* Keep ownership for subsequent off/on toggles without reconstructing
+       the tool. Only undo visibility which this plugin changed. */
+    return liquid_tool_ray_hidden ? liquid_set_tool_ray_visibility(1u) : 0;
+}
+
+static int liquid_restore_native_ray_nodes(void)
+{
+    unsigned int i;
+    int changed = liquid_restore_tool_ray_nodes();
     for (i = 0; i < liquid_hidden_native_ray_node_count; ++i) {
         void *object = liquid_hidden_native_ray_nodes[i];
         if (object) changed += liquid_set_script_visibility(object, 1u);
@@ -1146,7 +1221,6 @@ static void create_default_config_if_missing(void)
         "; model_pulse_decay - Strength lost by each successive pulse (0.0 to 0.8).\r\n"
         "; model_stream_cohesion - Time a pulse stays connected (0.02 to 2.0 seconds).\r\n"
         "; model_satellite_chance - Fraction emitted as separate droplets (0.0 to 0.75).\r\n"
-        "; tool_duration - X-key tool emission duration (0.1 to 30.0 seconds).\r\n"
         "; tool_start_delay - Delay before the X-key tool ray (0.0 to 5.0 seconds).\r\n"
         "[liquids]\r\n"
         "enabled = true\r\n"
@@ -1160,7 +1234,11 @@ static void create_default_config_if_missing(void)
         "model_pulse_decay = 0.10\r\n"
         "model_stream_cohesion = 0.72\r\n"
         "model_satellite_chance = 0.16\r\n"
-        "tool_duration = 10.0\r\n"
+        "; pov_enabled - Use shared physics liquids for the POV tool; false keeps native behavior.\r\n"
+        "; POV lifetime follows the pulse sequence; launch is boosted and aimed with gravity/drag compensation.\r\n"
+        "pov_enabled = false\r\n"
+        "; pov_reach - Fixed cursor aiming depth from the camera in game units (0.5 to 10.0). Not a maximum travel distance.\r\n"
+        "pov_reach = 2.5\r\n"
         "tool_start_delay = 2.0\r\n"
         "\r\n"
         "; enabled - Retract the emitting model's testicles once per pulse.\r\n"
@@ -1222,10 +1300,11 @@ static void create_default_config_if_missing(void)
         "\r\n"
         "; enabled - Stop model liquid at the first visible scene surface.\r\n"
         "; surface_hold - Contact visibility duration (0.05 to 10.0 seconds).\r\n"
-        "; depth_tolerance - Contact precision allowance (0.00005 to 0.05).\r\n"
+        "; depth_tolerance - Maximum depth precision allowance (0.00005 to 0.05); capped to 0.002 camera units for distant contacts.\r\n"
         "; follow_bodies - Attach landed droplets to a moving person.\r\n"
         "; surface_spread - Contact widening amount (0.0 to 3.0).\r\n"
         "; spawn_model_stains - Create native sperm00-15 stains on contact.\r\n"
+        "; spawn_room_stains - Experimental native stains on verified room mesh contacts.\r\n"
         "; model_stain_rate - Maximum stain requests per second (1.0 to 60.0).\r\n"
         "; native_decal_drip - Allow native stains to animate and fade.\r\n"
         "[liquid_collision]\r\n"
@@ -1235,6 +1314,7 @@ static void create_default_config_if_missing(void)
         "follow_bodies = false\r\n"
         "surface_spread = 0.45\r\n"
         "spawn_model_stains = true\r\n"
+        "spawn_room_stains = false\r\n"
         "model_stain_rate = 12.0\r\n"
         "native_decal_drip = true\r\n"
         "\r\n"
@@ -1432,7 +1512,11 @@ static void load_config(void)
         "liquids", "model_stream_cohesion", 0.72f);
     cfg.model_satellite_chance = read_float(
         "liquids", "model_satellite_chance", 0.16f);
-    cfg.tool_duration = read_float("liquids", "tool_duration", 10.0f);
+    cfg.pov_enabled = read_bool("liquids", "pov_enabled", 0);
+    cfg.pov_reach = read_float("liquids", "pov_reach", 2.5f);
+    if (!_finite(cfg.pov_reach)) cfg.pov_reach = 2.5f;
+    if (cfg.pov_reach < 0.5f) cfg.pov_reach = 0.5f;
+    if (cfg.pov_reach > 10.0f) cfg.pov_reach = 10.0f;
     cfg.tool_start_delay = read_float("liquids", "tool_start_delay", 2.0f);
     {
         static const char *keys[] = { "position_x", "position_y", "position_z" };
@@ -1512,6 +1596,8 @@ static void load_config(void)
         read_float("liquid_collision", "connection_thickness", 0.55f));
     cfg.collision_spawn_model_stains = read_bool(
         "liquid_collision", "spawn_model_stains", 1);
+    cfg.collision_spawn_room_stains = read_bool(
+        "liquid_collision", "spawn_room_stains", 0);
     cfg.collision_model_stain_rate = read_float(
         "liquid_collision", "model_stain_rate", 12.0f);
     cfg.collision_native_decal_drip = read_bool(
@@ -1553,8 +1639,6 @@ static void load_config(void)
         cfg.model_satellite_chance = 0.0f;
     if (cfg.model_satellite_chance > 0.75f)
         cfg.model_satellite_chance = 0.75f;
-    if (cfg.tool_duration < 0.1f) cfg.tool_duration = 0.1f;
-    if (cfg.tool_duration > 30.0f) cfg.tool_duration = 30.0f;
     if (cfg.tool_start_delay < 0.0f) cfg.tool_start_delay = 0.0f;
     if (cfg.tool_start_delay > 5.0f) cfg.tool_start_delay = 5.0f;
     if (cfg.testicular_retraction_target_weight < 0.0f)
@@ -1732,6 +1816,7 @@ static void liquid_check_config_reload(DWORD now)
     WIN32_FILE_ATTRIBUTE_DATA attributes;
     int previous_limit;
     int previous_liquids_enabled;
+    int previous_pov_enabled;
     float previous_emitter_position[3];
     if (now - liquid_config_check_tick < 500) return;
     if (InterlockedCompareExchange(&liquid_config_reload_lock, 1, 0) != 0)
@@ -1752,6 +1837,7 @@ static void liquid_check_config_reload(DWORD now)
                         &liquid_config_write_time) != 0) {
         previous_limit = cfg.particle_limit;
         previous_liquids_enabled = cfg.liquids_enabled;
+        previous_pov_enabled = cfg.pov_enabled;
         memcpy(previous_emitter_position, cfg.emitter_position,
                sizeof(previous_emitter_position));
         liquid_config_write_time = attributes.ftLastWriteTime;
@@ -1777,6 +1863,17 @@ static void liquid_check_config_reload(DWORD now)
             last_tool_command_tick = 0;
             log_line("custom liquids disabled; native TK17 ejaculation restored spermray_nodes=%d",
                      restored_nodes);
+        }
+        if (previous_pov_enabled && !cfg.pov_enabled) {
+            int index;
+            liquid_restore_tool_ray_nodes();
+            memset(&tool_emitter, 0, sizeof(tool_emitter));
+            for (index = 0; index < LIQUID_PARTICLE_CAP; ++index)
+                if (liquid_particles[index].source_kind == 2)
+                    memset(&liquid_particles[index], 0, sizeof(liquid_particles[index]));
+            for (index = 0; index < LIQUID_AUDIO_PENDING_CAP; ++index)
+                if (liquid_audio_pending[index].person_index == 0)
+                    liquid_audio_pending[index].active = 0;
         }
         if (cfg.particle_limit < previous_limit)
             memset(&liquid_particles[cfg.particle_limit], 0,
@@ -1912,7 +2009,8 @@ static void liquid_remember_spermray_source_person(void *source,
     static unsigned int cursor;
     unsigned int index;
     liquid_spermray_source_person_t *slot;
-    if (!source || person_index < 1 || person_index > 4) return;
+    if (!source || (person_index != -1 &&
+        (person_index < 1 || person_index > 4))) return;
     for (index = 0; index < LIQUID_SPERMRAY_SOURCE_SLOTS; index++) {
         slot = &liquid_spermray_source_people[index];
         if (slot->source == source || !slot->source) {
@@ -1944,7 +2042,8 @@ static int liquid_spermray_source_person(const void *source)
 static int liquid_transform_node_name(const char *name)
 {
     if (!name) return 0;
-    return contains_i(name, "spermray_group") ||
+    return _stricmp(name, "tool_mesh") == 0 || _stricmp(name, "Tool01") == 0 ||
+           contains_i(name, "spermray_group") ||
            contains_i(name, "spermray01_group") ||
            contains_i(name, "spermray01_splashSource") ||
            liquid_person_spermray_root_name(name) != 0 ||
@@ -1960,6 +2059,8 @@ static void remember_liquid_transform_node(void *object, const char *name)
     int empty = -1;
     int person_index;
     if (!object || !liquid_transform_node_name(name)) return;
+    if (_stricmp(name, "tool_mesh") == 0) latest_tool_mesh_object = object;
+    else if (_stricmp(name, "Tool01") == 0) tool_mesh_object = latest_tool_mesh_object;
     /* The X-key tool builds a temporary spermray hierarchy, then removes its
        public name before the configured emission delay expires.  Retain the
        actual group while its root is being named so the emitter can keep
@@ -1981,12 +2082,12 @@ static void remember_liquid_transform_node(void *object, const char *name)
                 (PVOID volatile *)&tool_spermray_group_object, group);
     }
     person_index = liquid_person_spermray_root_name(name);
-    if (person_index) {
+    if (person_index || _stricmp(name, "Tool01Spermray") == 0) {
         void *source = (void*)InterlockedCompareExchangePointer(
             (PVOID volatile *)&latest_spermray_splash_source_object,
             NULL, NULL);
         if (source)
-            liquid_remember_spermray_source_person(source, person_index);
+            liquid_remember_spermray_source_person(source, person_index ? person_index : -1);
     }
     for (i = 0; i < LIQUID_TRANSFORM_NODE_SLOTS; i++) {
         liquid_transform_node_t *entry = &liquid_transform_nodes[i];
@@ -2547,8 +2648,10 @@ static void THISCALL hook_Customizer_PrepareControls(void *self)
 {
     int enabled_count;
     int presets_injected;
+    liquid_pov_settings_build_depth++;
     if (tramp_Customizer_PrepareControls)
         tramp_Customizer_PrepareControls(self);
+    liquid_pov_settings_build_depth--;
     /* BuildControls calls this method immediately before its Enable loop;
        therefore its final parameter array is available and no rebuild is
        required after changing the seven matching objects. */
@@ -2820,8 +2923,13 @@ static int THISCALL hook_Customizer_BuildControls(void *self, void *arg1,
     int record_count = 0;
     int count;
     int index;
+    /* Saved ConfigEditor values and defaults generate ParamChange while
+       building controls. They must not overwrite the authoritative POV INI
+       before the existing synchronization below has read it. */
+    liquid_pov_settings_build_depth++;
     result = tramp_Customizer_BuildControls ?
         tramp_Customizer_BuildControls(self, arg1, arg2, arg3) : 0;
+    liquid_pov_settings_build_depth--;
     if (!self ||
         !ptr_readable((BYTE*)self + 0x14, sizeof(parameters)) ||
         !ptr_readable((BYTE*)self + 0x18, sizeof(records))) return result;
@@ -2859,6 +2967,10 @@ static int THISCALL hook_Customizer_BuildControls(void *self, void *arg1,
         memcpy(&widget, (BYTE*)record + 0x24, sizeof(widget));
         if (!widget) continue;
         liquid_sync_spinbox_from_ini(binding, widget);
+        if (_stricmp(binding->param_name, "NcLiquidsPovEnabled") == 0) {
+            liquid_pov_control_ready = 1;
+            log_line("settings POV control ready ini_enabled=%d", read_bool("liquids", "pov_enabled", 0));
+        }
     }
     return result;
 }
@@ -2936,6 +3048,15 @@ static void THISCALL hook_ConfigEditor_ParamChange(
         tramp_ConfigEditor_ParamChange(self, parameter, value, arg3, arg4);
     }
     if (parameter_text[0] && !liquid_setting_sync_depth) {
+        /* Startup also replays saved values before the first BuildControls.
+           Only accept POV edits after its actual widget has been built;
+           suppress initialization again whenever controls are rebuilt. */
+        if (_stricmp(parameter_text, "NcLiquidsPovEnabled") == 0 &&
+            (!liquid_pov_control_ready || liquid_pov_settings_build_depth)) {
+            log_line("settings initialization ignored param=\"%s\" value=\"%s\" preserving=[liquids] pov_enabled",
+                     parameter_text, value_text);
+            return;
+        }
         liquid_handle_setting_change(parameter_text,
                                      value_text[0] ? value_text : NULL);
     }
@@ -3571,6 +3692,33 @@ static int liquid_contact_target_position(
     return 1;
 }
 
+static void liquid_contact_attached_normal(const liquid_contact_person_t *person,
+    liquid_particle_t *particle, int store)
+{
+    float basis[3][3], origin[3];
+    if (!person->valid || !particle->contact_normal_valid ||
+        (!store && !particle->contact_local_normal_valid)) return;
+    if (particle->contact_anchor_end > 0) {
+        if (!liquid_contact_segment_frame(person, particle->contact_anchor-1,
+            particle->contact_anchor_end-1, particle->contact_segment_t,
+            origin,basis[2],basis[0],basis[1])) return;
+    } else {
+        memcpy(basis[0],person->horizontal,sizeof(basis[0]));
+        memcpy(basis[1],person->vertical,sizeof(basis[1]));
+        memcpy(basis[2],person->depth,sizeof(basis[2]));
+    }
+    if (store) {
+        for(int i=0;i<3;i++)
+            particle->contact_local_normal[i]=liquid_vec3_dot(particle->contact_normal,basis[i]);
+        particle->contact_local_normal_valid=1;
+    } else {
+        for(int i=0;i<3;i++)
+            particle->contact_normal[i]=basis[0][i]*particle->contact_local_normal[0]+
+                basis[1][i]*particle->contact_local_normal[1]+basis[2][i]*particle->contact_local_normal[2];
+        particle->contact_normal_valid=liquid_vec3_normalize(particle->contact_normal);
+    }
+}
+
 static int liquid_has_active_particles(void)
 {
     int i;
@@ -3579,13 +3727,18 @@ static int liquid_has_active_particles(void)
     return 0;
 }
 
+static int liquid_shared_source(int source_kind)
+{
+    return source_kind == 1 || source_kind == 2;
+}
+
 static int liquid_has_airborne_model_particles(void)
 {
     int i;
     for (i = 0; i < cfg.particle_limit; i++)
         if (liquid_particles[i].active &&
             !liquid_particles[i].collided &&
-            liquid_particles[i].source_kind == 1) return 1;
+            liquid_shared_source(liquid_particles[i].source_kind)) return 1;
     return 0;
 }
 
@@ -3597,7 +3750,7 @@ static unsigned int liquid_body_follow_person_mask(void)
     for (i = 0; i < cfg.particle_limit; i++) {
         const liquid_particle_t *particle = &liquid_particles[i];
         if (!particle->active || !particle->collided ||
-            particle->source_kind != 1) continue;
+            !liquid_shared_source(particle->source_kind)) continue;
         if (particle->contact_person >= 1 &&
             particle->contact_person <= 4) {
             person_mask |= 1u << (particle->contact_person - 1);
@@ -3841,6 +3994,7 @@ static int liquid_attach_contact_to_body(
             particle->contact_local_offset[2] =
                 liquid_vec3_dot(delta, person->depth);
         }
+        liquid_contact_attached_normal(person, particle, 1);
         memcpy(particle->contact_anchor_world, anchor,
                sizeof(particle->contact_anchor_world));
         if (attachment_log_count < 12) {
@@ -3907,6 +4061,7 @@ static void liquid_follow_attached_contact(liquid_particle_t *particle)
         &liquid_contact_older_cache_tick, 0, 0);
     LeaveCriticalSection(&contact_lock);
     person = &person_snapshot;
+    liquid_contact_attached_normal(person, particle, 0);
     previous_person = &previous_person_snapshot;
     older_person = &older_person_snapshot;
     anchor = &person->anchors[anchor_index];
@@ -4009,10 +4164,12 @@ static void liquid_follow_attached_contact(liquid_particle_t *particle)
 
 static int liquid_world_to_view_point(const float world[3], float view[3])
 {
-    const float *m = captured_camera_inverse;
+    const float *m = liquid_scene_camera_override ?
+        liquid_scene_camera_override : captured_camera_inverse;
     float relative[3];
     if (!world || !view ||
-        !InterlockedCompareExchange(&captured_camera_inverse_valid, 0, 0))
+        (!liquid_scene_camera_override &&
+         !InterlockedCompareExchange(&captured_camera_inverse_valid, 0, 0)))
         return 0;
     relative[0] = world[0] - m[12];
     relative[1] = world[1] - m[13];
@@ -4035,6 +4192,7 @@ static liquid_emitter_t *liquid_model_emitter_for_emission(
 {
     int index;
     if (!emission_id) return NULL;
+    if (tool_emitter.emission_id == emission_id) return &tool_emitter;
     for (index = 0; index < LIQUID_MODEL_EMITTER_COUNT; index++) {
         if (model_emitters[index].emission_id == emission_id)
             return &model_emitters[index];
@@ -4232,7 +4390,8 @@ static int liquid_contact_attachment_outcome(
         }
     }
     if (!particle) return LIQUID_ATTACHMENT_EXPIRED;
-    if (particle->contact_physx_person < 0) return LIQUID_ATTACHMENT_ROOM;
+    if (particle->contact_physx_person < 0 ||
+        InterlockedCompareExchange(&particle->room_contact_verified, 0, 0)) return LIQUID_ATTACHMENT_ROOM;
     /* PhysX ownership already drives render-thread body attachment. Its
        response shell (and clothing) need not coincide with the picked skin.
        Report that existing evidence without declaring an exact mesh match,
@@ -4277,9 +4436,11 @@ static void liquid_queue_native_model_contact(
     float direction[3];
     int slot_index;
     int emitter_index;
-    if (!particle || particle->secondary || particle->contact_physx_person < 0 ||
-        !cfg.collision_spawn_model_stains ||
-        particle->source_kind != 1 || !particle->emission_id)
+    if (!particle || particle->secondary ||
+        (particle->contact_physx_person < 0 ? !cfg.collision_spawn_room_stains :
+         particle->contact_physx_person > 0 ? !cfg.collision_spawn_model_stains :
+         !(cfg.collision_spawn_model_stains || cfg.collision_spawn_room_stains)) ||
+        !liquid_shared_source(particle->source_kind) || !particle->emission_id)
         return;
     memcpy(direction, particle->impact_velocity, sizeof(direction));
     if (!liquid_vec3_normalize(direction)) return;
@@ -4288,9 +4449,9 @@ static void liquid_queue_native_model_contact(
         liquid_emitter_t *emitter =
             liquid_model_emitter_for_emission(particle->emission_id);
         if (!emitter) return;
-        emitter_index = emitter->person_index - 1;
+        emitter_index = emitter->source_kind == 2 ? LIQUID_MODEL_EMITTER_COUNT : emitter->person_index - 1;
         if (emitter_index < 0 ||
-            emitter_index >= LIQUID_MODEL_EMITTER_COUNT) return;
+            emitter_index > LIQUID_MODEL_EMITTER_COUNT) return;
     }
     /* Sample current impacts at the configured stain rate. Excess contacts
        are discarded here instead of being queued, so a completed liquid
@@ -4321,6 +4482,13 @@ static void liquid_queue_native_model_contact(
         slot->emission_id = particle->emission_id;
         slot->particle_id = particle->spawn_order;
         slot->retry_count = 0;
+        slot->target_kind = cfg.collision_spawn_room_stains && particle->contact_normal_valid ?
+            (particle->contact_physx_person < 0 ? 1 : particle->contact_physx_person == 0 ? 2 : 0) : 0;
+        if (particle->contact_physx_person < 0 && !slot->target_kind) {
+            InterlockedExchange(&slot->state, 0);
+            return;
+        }
+        memcpy(slot->normal_world, particle->contact_normal, sizeof(slot->normal_world));
         slot->impact_world[0] = particle->position[0];
         slot->impact_world[1] = particle->position[1];
         slot->impact_world[2] = particle->position[2];
@@ -4421,7 +4589,8 @@ static int liquid_retry_native_model_contact(
         now - contact->tick > LIQUID_NATIVE_CONTACT_RETRY_WINDOW_MS ||
         !liquid_native_contact_particle_alive(contact)) return 0;
     emitter = liquid_model_emitter_for_emission(contact->emission_id);
-    if (!emitter || now > emitter->end_tick) return 0;
+    if (!emitter || now > emitter->end_tick +
+        (emitter->source_kind == 2 ? LIQUID_NATIVE_CONTACT_MAX_AGE_MS : 0u)) return 0;
     for (slot_index = 0; slot_index < LIQUID_NATIVE_CONTACT_SLOTS;
          slot_index++) {
         liquid_native_contact_t *slot =
@@ -4434,6 +4603,8 @@ static int liquid_retry_native_model_contact(
         slot->emission_id = contact->emission_id;
         slot->particle_id = contact->particle_id;
         slot->retry_count = contact->retry_count + 1;
+        slot->target_kind = contact->target_kind;
+        memcpy(slot->normal_world, contact->normal_world, sizeof(slot->normal_world));
         memcpy(slot->impact_world, contact->impact_world,
                sizeof(slot->impact_world));
         memcpy(slot->origin_world, contact->origin_world,
@@ -4984,6 +5155,228 @@ static int liquid_offset_emitter_position(
     return 1;
 }
 
+static void liquid_tool_fallback_view(float view[3])
+{
+    float projection_y = 2.41421356f;
+    if (InterlockedCompareExchange(&captured_d3d_projection_valid, 0, 0) &&
+        _finite(captured_d3d_projection._22) &&
+        fabsf(captured_d3d_projection._22) > 0.01f) {
+        projection_y = fabsf(captured_d3d_projection._22);
+    } else if (hook5_get_fov_multiplier) {
+        float multiplier = 1.0f;
+        if (hook5_get_fov_multiplier(1u, &multiplier) &&
+            _finite(multiplier) && multiplier > 0.01f)
+            projection_y /= multiplier;
+    }
+    view[0] = 0.0f;
+    view[2] = -0.25f;
+    view[1] = -0.80f * -view[2] / projection_y;
+}
+
+
+/* Liquid rendering and depth sampling use full scene NDC. Native PickView
+   channel offsets are not screen coordinates; prefer the actual client cursor. */
+static float liquid_tool_crosshair[2];
+static DWORD liquid_tool_crosshair_tick;
+static int liquid_tool_crosshair_source; /* 0 initial centre, 1 native fallback, 2 client cursor, 3 held during camera gesture */
+static float liquid_tool_free_crosshair[2];
+static int liquid_tool_free_crosshair_valid;
+static int liquid_tool_camera_button; /* Held MK_LBUTTON/MK_RBUTTON bits. */
+static POINT liquid_tool_cursor_pixel;
+static SIZE liquid_tool_cursor_client;
+static float liquid_tool_launch_target[3];
+static int liquid_tool_launch_target_valid;
+static float liquid_tool_aim_target_view[3];
+/* Hook5 can expose a different projection during early scene processing.
+   Retain the one used to composite the visible scene, plus its live FOV. */
+static D3DMATRIX liquid_tool_composite_projection;
+static DWORD liquid_tool_composite_projection_tick;
+static float liquid_tool_composite_fov;
+static int liquid_tool_aim_uses_composite;
+typedef void (__cdecl *liquid_mouse_device_t)(void *, int, int, float *, float *, int);
+typedef void (__cdecl *liquid_mouse_channel_t)(void *, float *, float *, int);
+static liquid_mouse_device_t liquid_mouse_device;
+static liquid_mouse_channel_t liquid_mouse_channel;
+
+static int liquid_client_cursor_ndc(POINT cursor, const RECT *client, float *x, float *y)
+{
+    LONG width = client->right - client->left, height = client->bottom - client->top;
+    if (width <= 0 || height <= 0 || cursor.x < client->left || cursor.y < client->top ||
+        cursor.x >= client->right || cursor.y >= client->bottom) return 0;
+    /* Use client coordinates (no window border/title bar) and normalize before
+       mapping to the scene target, which may render at a different resolution. */
+    *x = 2.0f*(cursor.x - client->left)/(float)width - 1.0f;
+    *y = 1.0f - 2.0f*(cursor.y - client->top)/(float)height;
+    return 1;
+}
+
+static int liquid_read_client_cursor(float *x, float *y)
+{
+    HWND window = GetForegroundWindow();
+    DWORD process = 0;
+    POINT cursor;
+    RECT client;
+    if (!window) return 0;
+    GetWindowThreadProcessId(window, &process);
+    if (process != GetCurrentProcessId() || !GetCursorPos(&cursor) ||
+        !ScreenToClient(window, &cursor) || !GetClientRect(window, &client) ||
+        !liquid_client_cursor_ndc(cursor, &client, x, y)) return 0;
+    liquid_tool_cursor_pixel = cursor;
+    liquid_tool_cursor_client.cx = client.right - client.left;
+    liquid_tool_cursor_client.cy = client.bottom - client.top;
+    return 1;
+}
+
+static void liquid_tool_begin_camera_gesture(int button)
+{
+    if (!cfg.liquids_enabled || !cfg.pov_enabled) return;
+    /* Native input may recenter before our window subclass sees button-down.
+       Never overwrite the last free sample with a cursor read at this point. */
+    liquid_tool_camera_button |= button;
+}
+
+static int liquid_tool_camera_button_down(void)
+{
+    DWORD process = 0;
+    HWND window;
+    /* Most frames have no camera gesture; avoid duplicate window/process
+       queries before the normal free-cursor capture on that path. */
+    if (!((GetAsyncKeyState(VK_RBUTTON) | GetAsyncKeyState(VK_LBUTTON)) & 0x8000)) return 0;
+    window = GetForegroundWindow();
+    if (!window) return 0;
+    GetWindowThreadProcessId(window, &process);
+    return process == GetCurrentProcessId();
+}
+
+static int liquid_pov_camera_look_active(void *update, void *input);
+
+static void liquid_capture_tool_crosshair(void *update, void *input, DWORD now)
+{
+    void *context, *device, *channel;
+    float x = 0, y = 0;
+    int source = 0;
+    if (!cfg.liquids_enabled || !cfg.pov_enabled) {
+        liquid_tool_free_crosshair_valid = 0;
+        liquid_tool_camera_button = 0;
+        return;
+    }
+    if (!ptr_readable(update, sizeof(void*)) || !ptr_readable(input, 12)) return;
+    context = *(void**)update;
+    if (!ptr_readable(context, 0x14)) return;
+    device = *(void**)((BYTE*)context + 0x10);
+    channel = *(void**)((BYTE*)context + 0x0c);
+    if (*((BYTE*)input + 1) || liquid_tool_camera_button || liquid_tool_camera_button_down() ||
+        liquid_pov_camera_look_active(update, input)) {
+        if (liquid_tool_free_crosshair_valid) {
+            x = liquid_tool_free_crosshair[0];
+            y = liquid_tool_free_crosshair[1];
+            source = 3;
+        }
+    } else {
+        if (liquid_read_client_cursor(&x, &y)) {
+            source = 2;
+        } else {
+            source = 1;
+            if (!liquid_mouse_device || !liquid_mouse_channel) {
+                HMODULE app = GetModuleHandleA("ThriXXX010278-APP.dll");
+                if (!app) return;
+                copy_proc_address(&liquid_mouse_device, GetProcAddress(app,
+                    "?MouseToDevice@Bionic@@YAXPAVScriptObject@1@HHAAM1H@Z"), sizeof(liquid_mouse_device));
+                copy_proc_address(&liquid_mouse_channel, GetProcAddress(app,
+                    "?MouseToChannel@Bionic@@YAXPAVScriptObject@1@AAM1H@Z"), sizeof(liquid_mouse_channel));
+            }
+            if (!liquid_mouse_device || !liquid_mouse_channel ||
+                !liquid_node_interface(device, 0x200) ||
+                !liquid_node_interface(channel, 0x204)) return;
+            liquid_mouse_device(device, *(int*)((BYTE*)input + 4),
+                                *(int*)((BYTE*)input + 8), &x, &y, 1);
+            liquid_mouse_channel(channel, &x, &y, 1);
+        }
+    }
+    if (!_finite(x) || !_finite(y) || fabsf(x) > 2 || fabsf(y) > 2) return;
+    if (source == 1 || source == 2) {
+        liquid_tool_free_crosshair[0] = x;
+        liquid_tool_free_crosshair[1] = y;
+        liquid_tool_free_crosshair_valid = 1;
+    }
+    liquid_tool_crosshair[0] = x;
+    liquid_tool_crosshair[1] = y;
+    liquid_tool_crosshair_tick = now;
+    liquid_tool_crosshair_source = source;
+}
+
+static int liquid_tool_view_frame(void *object, float frame[16])
+{
+    liquid_vector_get_t getter = (liquid_vector_get_t)liquid_node_method(object, 0x124, 0x80);
+    int i;
+    if (!getter) return 0;
+    memset(frame, 0, 16 * sizeof(float));
+    getter(object, 0x02fff049u, frame); /* TBaseTransform.ModelViewMatrix */
+    for (i = 0; i < 16; ++i)
+        if (!_finite(frame[i]) || fabsf(frame[i]) > 1000000) return 0;
+    return fabsf(frame[15] - 1) < 0.001f &&
+        frame[0]*frame[0] + frame[1]*frame[1] + frame[2]*frame[2] > 0.000001f;
+}
+
+static int liquid_tool_outlet_view(const float frame[16], float position[3], float direction[3])
+{
+    int axis;
+    /* Frontmost centre vertex in the visible Tool01 tool_mesh. Unlike
+       the detached spermray mesh, this is on the rendered tool itself.
+       Apply the mesh frame once, preserving its live scale and rotation. */
+    for (axis = 0; axis < 3; ++axis) {
+        position[axis] = frame[12 + axis] - 0.00045815884f * frame[4 + axis] -
+                        0.00032760238f * frame[8 + axis];
+        direction[axis] = -frame[8 + axis];
+    }
+    return liquid_vec3_normalize(direction);
+}
+
+static int liquid_tool_crosshair_direction(const float origin[3], float direction[3], DWORD now)
+{
+    D3DMATRIX projection = captured_d3d_projection;
+    const D3DMATRIX *m = &projection;
+    float x, y, z, a, b, c, d, u, v, determinant;
+    if (!liquid_tool_crosshair_tick || now - liquid_tool_crosshair_tick > 250 ||
+        !InterlockedCompareExchange(&captured_d3d_projection_valid, 0, 0)) return 0;
+    liquid_tool_aim_uses_composite = 0;
+    if (hook5_get_projection_matrix && liquid_tool_composite_projection_tick &&
+        now - liquid_tool_composite_projection_tick <= 250) {
+        float fov;
+        projection = liquid_tool_composite_projection;
+        liquid_tool_aim_uses_composite = 1;
+        /* React immediately when FOV changes between composite and the next
+           simulation. The stored matrix already includes the previous FOV. */
+        if (liquid_tool_composite_fov > 0 && hook5_get_fov_multiplier &&
+            hook5_get_fov_multiplier(1u, &fov) && _finite(fov) && fov >= 0.05f && fov <= 8) {
+            projection._11 *= liquid_tool_composite_fov / fov;
+            projection._22 *= liquid_tool_composite_fov / fov;
+        }
+    } else if (hook5_get_projection_matrix) {
+        /* Startup/stalled-composite fallback; native renderers retain their
+           existing captured scene projection. */
+        D3DMATRIX scene;
+        if (hook5_get_projection_matrix(1u, (float*)&scene)) projection = scene;
+    }
+    x = liquid_tool_crosshair[0]; y = liquid_tool_crosshair[1];
+    /* A fixed camera-depth plane defines useful reach. Scene depth, missing
+       readbacks and what the cursor hovers over cannot shorten a pulse. */
+    z = -fmaxf(cfg.pov_reach, -origin[2] + 0.25f);
+    a = m->_11 - x*m->_14; b = m->_21 - x*m->_24;
+    c = m->_12 - y*m->_14; d = m->_22 - y*m->_24;
+    u = x*(z*m->_34 + m->_44) - z*m->_31 - m->_41;
+    v = y*(z*m->_34 + m->_44) - z*m->_32 - m->_42;
+    determinant = a*d-b*c;
+    if (!_finite(determinant) || fabsf(determinant) < 0.000001f) return 0;
+    liquid_tool_aim_target_view[0] = (u*d-b*v)/determinant;
+    liquid_tool_aim_target_view[1] = (a*v-u*c)/determinant;
+    liquid_tool_aim_target_view[2] = z;
+    direction[0] = liquid_tool_aim_target_view[0] - origin[0];
+    direction[1] = (a*v-u*c)/determinant - origin[1];
+    direction[2] = z - origin[2];
+    return liquid_vec3_normalize(direction);
+}
+
 static int liquid_emitter_transform(const liquid_emitter_t *emitter,
                                     float position[3], float direction[3])
 {
@@ -4999,39 +5392,49 @@ static int liquid_emitter_transform(const liquid_emitter_t *emitter,
     int person;
     if (!emitter || !position || !direction) return 0;
     if (emitter->source_kind == 2) {
-        static LONG tool_view_fallback_logged;
-        void *tool_group = (void*)InterlockedCompareExchangePointer(
-            (PVOID volatile *)&tool_spermray_group_object, NULL, NULL);
-        void *tool_root = (void*)InterlockedCompareExchangePointer(
-            (PVOID volatile *)&tool_spermray_root_object, NULL, NULL);
-        lstrcpynA(source_name, "Tool01Spermray:spermray01_group",
-                  sizeof(source_name));
-        source_name[sizeof(source_name) - 1] = 0;
-        if (!liquid_object_view_pivot(source_name, source_view) &&
-            !liquid_live_object_view_pivot(
-                tool_group, "Tool01Spermray:spermray01_group", source_view) &&
-            !liquid_live_object_view_pivot(
-                tool_root, "Tool01Spermray", source_view)) {
-            /* The POV tool is a temporary viewport object rather than a
-               persistent scene node.  If TK17 has already released its live
-               transform, emit from the tool's stable bottom-centre viewport
-               position instead of dropping the entire effect. */
-            source_view[0] = 0.0f;
-            source_view[1] = -0.72f;
-            source_view[2] = -1.25f;
-            if (!InterlockedExchange(&tool_view_fallback_logged, 1))
-                log_line("liquid tool transform fallback active view=(%.3f,%.3f,%.3f)",
-                         source_view[0], source_view[1], source_view[2]);
+        static unsigned int logged_emission;
+        static int logged_pulse;
+        float frame[16] __attribute__((aligned(16)));
+        float view_direction[3] = {0, 0, -1};
+        const char *mode = "visible-tool-tip", *aim = "tool-axis";
+        int axis, aim_mode;
+        if ((!liquid_tool_view_frame(liquid_find_object("Tool01:tool_mesh"), frame) &&
+             !liquid_tool_view_frame(tool_mesh_object, frame)) ||
+            !liquid_tool_outlet_view(frame, source_view, view_direction)) {
+            liquid_tool_fallback_view(source_view);
+            mode = "projection-fallback";
         }
-        if (!liquid_view_to_world_point(source_view, source_world)) return 0;
-        position[0] = source_world[0];
-        position[1] = source_world[1];
-        position[2] = source_world[2];
-        /* Visible camera space points down -Z. */
-        direction[0] = -captured_camera_inverse[8];
-        direction[1] = -captured_camera_inverse[9];
-        direction[2] = -captured_camera_inverse[10];
-        return liquid_vec3_normalize(direction);
+        aim_mode = liquid_tool_crosshair_direction(source_view, view_direction, GetTickCount());
+        liquid_tool_launch_target_valid = aim_mode && liquid_view_to_world_point(
+            liquid_tool_aim_target_view, liquid_tool_launch_target);
+        if (aim_mode) aim = "cursor-fixed-reach";
+        if (!liquid_view_to_world_point(source_view, position)) return 0;
+        for (axis = 0; axis < 3; ++axis)
+            direction[axis] = view_direction[0]*captured_camera_inverse[axis] +
+                             view_direction[1]*captured_camera_inverse[4 + axis] +
+                             view_direction[2]*captured_camera_inverse[8 + axis];
+        if (!liquid_vec3_normalize(direction)) return 0;
+        if (cfg.enabled && emitter->emission_id &&
+            (logged_emission != emitter->emission_id || logged_pulse != emitter->current_pulse_index)) {
+            logged_emission = emitter->emission_id;
+            logged_pulse = emitter->current_pulse_index;
+            log_line("liquid POV emitter emission=%u pulse=%d mode=%s aim=%s cursor_source=%d cursor_pixel=(%ld,%ld) client=%ldx%ld crosshair=(%.4f,%.4f) view=(%.5f,%.5f,%.5f) world_direction=(%.5f,%.5f,%.5f) target_z=%.5f mesh=%p",
+                emitter->emission_id, logged_pulse, mode, aim, liquid_tool_crosshair_source,
+                liquid_tool_cursor_pixel.x, liquid_tool_cursor_pixel.y,
+                liquid_tool_cursor_client.cx, liquid_tool_cursor_client.cy,
+                liquid_tool_crosshair[0], liquid_tool_crosshair[1],
+                source_view[0], source_view[1], source_view[2], direction[0], direction[1], direction[2],
+                liquid_tool_aim_target_view[2], tool_mesh_object);
+            if (hook5_get_projection_matrix) {
+                float fov = 0;
+                if (hook5_get_fov_multiplier) hook5_get_fov_multiplier(1u, &fov);
+                log_line("liquid POV projection source=%s live_fov=%.5f composite_fov=%.5f composite_xy=(%.5f,%.5f) capture_xy=(%.5f,%.5f)",
+                    liquid_tool_aim_uses_composite ? "final-scene" : "current-fallback",
+                    fov, liquid_tool_composite_fov, liquid_tool_composite_projection._11,
+                    liquid_tool_composite_projection._22, captured_d3d_projection._11, captured_d3d_projection._22);
+            }
+        }
+        return 1;
     }
 
     person = emitter->person_index;
@@ -5215,7 +5618,13 @@ static int liquid_audio_person_position(int person_index, float position[3])
     liquid_emitter_t probe;
     float direction[3];
     int index = person_index - 1;
-    if (!position || person_index < 1 || person_index > 4) return 0;
+    if (!position) return 0;
+    if (person_index == 0) {
+        memset(&probe, 0, sizeof(probe));
+        probe.source_kind = 2;
+        return liquid_emitter_transform(&probe, position, direction);
+    }
+    if (person_index < 1 || person_index > 4) return 0;
     if (index >= 0 && index < LIQUID_MODEL_EMITTER_COUNT &&
         model_emitters[index].transform_valid) {
         memcpy(position, model_emitters[index].current_position,
@@ -5388,7 +5797,7 @@ static void liquid_audio_schedule_pulse(const liquid_emitter_t *emitter,
     liquid_audio_pending_t *pending = NULL;
     int file_index;
     int index;
-    if (!emitter || emitter->source_kind != 1 || liquid_audio_disabled())
+    if (!emitter || !liquid_shared_source(emitter->source_kind) || liquid_audio_disabled())
         return;
     liquid_audio_refresh_files();
     file_index = liquid_audio_choose_file();
@@ -5491,15 +5900,30 @@ static void liquid_begin_emitter(liquid_emitter_t *emitter, int source_kind,
              (unsigned long)emitter->end_tick);
 }
 
+static float liquid_tool_pulse_duration(void)
+{
+    return cfg.model_pulse_count * cfg.model_pulse_duration +
+           (cfg.model_pulse_count - 1) * cfg.model_pulse_interval;
+}
+
 static void liquid_note_tool_command(DWORD now)
 {
     if (!cfg.liquids_enabled) return;
-    /* CumShot is TK17's POV tool. Keep its native spermray untouched and do
-       not create custom liquid particles. The timestamp is retained only so
-       its native splash callbacks cannot be mistaken for person emission. */
     last_tool_command_tick = now;
-    memset(&tool_emitter, 0, sizeof(tool_emitter));
-    log_line("liquid POV tool command observed; custom emission disabled and native spermray retained");
+    if (cfg.pov_enabled) {
+        /* X reuses the hierarchy created when the tool loaded. Keep its
+           retained transform and hide its existing ray after a live enable. */
+        int changed = liquid_set_tool_ray_visibility(0u);
+        log_line("liquid POV native ray hidden nodes=%d retained_group=%p retained_root=%p",
+            changed, (void*)tool_spermray_group_object, (void*)tool_spermray_root_object);
+        liquid_begin_emitter(&tool_emitter, 2, 0,
+            now + (DWORD)(cfg.tool_start_delay * 1000.0f), liquid_tool_pulse_duration());
+        InterlockedExchange(&liquid_native_last_contact_queue_tick[LIQUID_MODEL_EMITTER_COUNT], 0);
+    } else {
+        liquid_restore_tool_ray_nodes();
+        memset(&tool_emitter, 0, sizeof(tool_emitter));
+        log_line("liquid POV tool command observed; custom emission disabled and native spermray retained");
+    }
 }
 
 static int liquid_runtime_splash_person(const void *splash_object)
@@ -5516,7 +5940,7 @@ static void liquid_note_runtime_splash(const void *splash_object,
                                        const void *caller)
 {
     DWORD now = GetTickCount();
-    DWORD tool_window = (DWORD)((cfg.tool_start_delay + cfg.tool_duration +
+    DWORD tool_window = (DWORD)((cfg.tool_start_delay + (cfg.pov_enabled ? liquid_tool_pulse_duration() : 10.0f) +
                                  1.0f) * 1000.0f);
     int person_index;
     liquid_emitter_t *emitter;
@@ -5524,9 +5948,11 @@ static void liquid_note_runtime_splash(const void *splash_object,
         !liquid_module_rva(caller, "ThriXXX010278-SYS.dll",
                            LIQUID_RUNTIME_SPLASH_RVA)) return;
     person_index = liquid_runtime_splash_person(splash_object);
-    if (!person_index && last_tool_command_tick &&
-        now - last_tool_command_tick <= tool_window) {
+    if (person_index == -1 || (!person_index && last_tool_command_tick &&
+        now - last_tool_command_tick <= tool_window)) {
         tool_emitter.last_native_splash_tick = now;
+        if (cfg.pov_enabled && tool_emitter.emission_id)
+            InterlockedExchange(&liquid_latest_model_emission, (LONG)tool_emitter.emission_id);
         return;
     }
     if (person_index < 1 || person_index > 4) person_index = 1;
@@ -5580,6 +6006,40 @@ static void liquid_sample_emitter_birth(
         memcpy(birth_direction, direction, sizeof(float) * 3);
 }
 
+static float liquid_tool_launch_velocity(const float position[3], const float target[3],
+                                        float strength, float velocity[3])
+{
+    float delta[3], distance, time;
+    double k = cfg.drag, travel, gravity_travel, x;
+    int axis;
+    for (axis = 0; axis < 3; ++axis) delta[axis] = target[axis] - position[axis];
+    distance = sqrtf(liquid_vec3_dot(delta, delta));
+    if (!_finite(distance) || distance < 0.001f) return 0;
+    /* Halve POV flight time to flatten gravity compensation: close surfaces
+       then intercept much less of the rising arc. Retain fixed reach and
+       pulse strength; only newly launched POV liquid receives this speed. */
+    time = distance / (fmaxf(12.0f, cfg.speed * 6.0f) * fmaxf(0.2f, strength));
+    time = fminf(fmaxf(time, 0.03f), fminf(0.3f, cfg.particle_lifetime * 0.3f));
+    x = k*time;
+    if (fabs(x) < 0.001) {
+        travel = time*(1 - x*0.5 + x*x/6);
+        gravity_travel = time*time*(0.5 - x/6 + x*x/24);
+    } else {
+        travel = (1 - exp(-x))/k;
+        gravity_travel = (time-travel)/k;
+    }
+    if (travel <= 0) return 0;
+    for (axis = 0; axis < 3; ++axis) {
+        double gravity = axis == 1 ? -9.81*cfg.gravity_strength : 0;
+        velocity[axis] = (float)((delta[axis]-gravity*gravity_travel)/travel);
+        if (!_finite(velocity[axis])) return 0;
+    }
+    /* Bound pathological distant targets/high drag without changing cfg. */
+    distance = sqrtf(liquid_vec3_dot(velocity, velocity));
+    if (distance > 100) for (axis = 0; axis < 3; ++axis) velocity[axis] *= 100/distance;
+    return time;
+}
+
 static void liquid_spawn_particle(liquid_emitter_t *emitter,
                                   const float position[3],
                                   const float direction[3],
@@ -5611,7 +6071,7 @@ static void liquid_spawn_particle(liquid_emitter_t *emitter,
         if (!liquid_particle_serial) liquid_particle_serial++;
         particle->spawn_order = liquid_particle_serial;
         particle->pulse_index = pulse_index;
-        if (emitter && emitter->source_kind == 1) {
+        if (emitter && liquid_shared_source(emitter->source_kind)) {
             float satellite_roll =
                 (liquid_random_signed() + 1.0f) * 0.5f;
             particle->satellite =
@@ -5631,13 +6091,29 @@ static void liquid_spawn_particle(liquid_emitter_t *emitter,
                        (liquid_random_signed() + 1.0f) * 0.12f) *
                       (0.72f + pulse_strength * 0.30f);
         /* Keep the main flow coherent; independent spray retains variation. */
-        if (emitter && emitter->source_kind == 1 && !particle->satellite)
+        if (emitter && liquid_shared_source(emitter->source_kind) && !particle->satellite)
             speed_scale = (0.94f + liquid_random_signed() * 0.015f) *
                           (0.72f + pulse_strength * 0.30f);
         particle->velocity[0] = velocity[0] * cfg.speed * speed_scale;
         particle->velocity[1] = velocity[1] * cfg.speed * speed_scale;
         particle->velocity[2] = velocity[2] * cfg.speed * speed_scale;
         particle->launch_speed = cfg.speed * speed_scale;
+        if (emitter && emitter->source_kind == 2) {
+            float launch[3], launch_speed;
+            int axis;
+            if (liquid_tool_launch_target_valid && liquid_tool_launch_velocity(
+                    position, liquid_tool_launch_target, speed_scale, launch)) {
+                launch_speed = sqrtf(liquid_vec3_dot(launch, launch));
+                for (axis = 0; axis < 3; ++axis)
+                    particle->velocity[axis] = launch[axis] +
+                        (velocity[axis] - direction[axis])*launch_speed;
+            } else {
+                for (axis = 0; axis < 3; ++axis)
+                    particle->velocity[axis] = velocity[axis] *
+                        fmaxf(12.0f, cfg.speed*6.0f)*speed_scale;
+            }
+            particle->launch_speed = sqrtf(liquid_vec3_dot(particle->velocity, particle->velocity));
+        }
         if (emitter && !particle->satellite) {
             int neighbor_index = emitter->last_stream_particle;
             if (neighbor_index >= 0 && neighbor_index < limit) {
@@ -5694,6 +6170,9 @@ static void liquid_update_emitter(liquid_emitter_t *emitter, DWORD now,
         emitter->transform_valid = 0;
         return;
     }
+    if (emitter->source_kind == 2)
+        emitter->end_tick = emitter->start_tick +
+            (DWORD)(liquid_tool_pulse_duration()*1000.0f + 0.5f);
     if (now < emitter->start_tick) return;
     if (now >= emitter->end_tick) {
         emitter->active = 0;
@@ -5754,7 +6233,7 @@ static void liquid_update_emitter(liquid_emitter_t *emitter, DWORD now,
                      direction[0], direction[1], direction[2]);
         }
     }
-    if (emitter->source_kind == 1) {
+    if (liquid_shared_source(emitter->source_kind)) {
         float elapsed = (float)(now - emitter->start_tick) * 0.001f;
         float cycle = cfg.model_pulse_duration + cfg.model_pulse_interval;
         pulse_index = cycle > 0.0001f ?
@@ -6148,7 +6627,7 @@ static void liquid_update_stream_stretch(float dt)
     float response = 1.0f - expf(-25.0f * dt);
     for (i = 0; i < cfg.particle_limit; i++) {
         liquid_particle_t *p = &liquid_particles[i];
-        if (!p->active || p->collided || p->satellite || p->source_kind != 1)
+        if (!p->active || p->collided || p->satellite || !liquid_shared_source(p->source_kind))
             continue;
         if (p->stream_neighbor_order && p->stream_rest_length > 0.0f &&
             p->stream_neighbor >= 0 && p->stream_neighbor < cfg.particle_limit) {
@@ -7382,9 +7861,26 @@ static int liquid_sample_depth_float(
     return _finite(*depth) && *depth >= 0.0f && *depth <= 1.0f;
 }
 
-static int liquid_depth_is_behind(float particle_depth, float scene_depth)
+static int liquid_depth_is_behind(const liquid_depth_snapshot_t *snapshot,
+                                 float particle_depth, float scene_depth)
 {
-    float tolerance = cfg.collision_depth_tolerance;
+    const D3DMATRIX *m = &snapshot->projection;
+    double tolerance = cfg.collision_depth_tolerance;
+    double denominator, view_z, w, shifted_w, world_bias;
+    /* Perspective depth is nonlinear: a fixed buffer tolerance can require
+       metres of penetration at a distant camera, which the world-contact
+       guard then correctly rejects. Cap the configured bias to 0.002 camera
+       units using this snapshot's projection (also valid for reverse Z).
+       Keep the independent world-surface/occluder validation unchanged. */
+    denominator = (double)scene_depth * m->_34 - m->_33;
+    if (!isfinite(denominator) || fabs(denominator) < 1e-12) return 0;
+    view_z = ((double)m->_43 - (double)scene_depth * m->_44) / denominator;
+    w = view_z * m->_34 + m->_44;
+    shifted_w = w - 0.002 * m->_34;
+    if (!isfinite(w) || !isfinite(shifted_w) || fabs(w * shifted_w) < 1e-12) return 0;
+    world_bias = fabs(0.002 * ((double)m->_33 * m->_44 -
+                             (double)m->_43 * m->_34) / (w * shifted_w));
+    if (world_bias < tolerance) tolerance = world_bias;
     switch (liquid_d3d11_depth_test_func) {
     case D3D11_COMPARISON_GREATER:
     case D3D11_COMPARISON_GREATER_EQUAL:
@@ -7495,7 +7991,7 @@ static int liquid_find_depth_sweep_front(
                 &particle_depth) ||
             !liquid_sample_depth_float(
                 snapshot, mapped, screen_x, screen_y, &scene_depth) ||
-            liquid_depth_is_behind(particle_depth, scene_depth))
+            liquid_depth_is_behind(snapshot, particle_depth, scene_depth))
             continue;
         memcpy(front, candidate, sizeof(float) * 3);
         if (steps_out) *steps_out = sweep_step;
@@ -7709,7 +8205,7 @@ static void liquid_spawn_impact_spray(liquid_particle_t *parent,
         if (p->active) continue;
         memset(p, 0, sizeof(*p));
         p->active = p->satellite = p->secondary = 1;
-        p->source_kind = 1;
+        p->source_kind = parent->source_kind;
         p->emission_id = parent->emission_id;
         p->pulse_index = parent->pulse_index;
         liquid_particle_serial++;
@@ -7854,7 +8350,7 @@ static void liquid_apply_depth_collisions(
         float world_gap = 0.0f;
         float world_limit = 0.0f;
         if (!sample->valid || !particle->active || particle->collided ||
-            particle->source_kind != 1 ||
+            !liquid_shared_source(particle->source_kind) ||
             particle->spawn_order != sample->spawn_order ||
             particle->emission_id != sample->emission_id ||
             sample->age < (particle->secondary ? 0.015f : 0.06f))
@@ -7945,7 +8441,7 @@ static void liquid_apply_depth_collisions(
                         float past_contact;
                         if (clip == particle || !clip->active ||
                             clip->collided || clip->satellite ||
-                            clip->source_kind != 1 ||
+                            !liquid_shared_source(clip->source_kind) ||
                             clip->emission_id != particle->emission_id ||
                             clip->stream_id != particle->stream_id ||
                             clip->pulse_index != particle->pulse_index ||
@@ -7984,7 +8480,7 @@ static void liquid_apply_depth_collisions(
                                        &current_scene_depth))
             continue;
         current_behind = liquid_depth_is_behind(
-            current_depth, current_scene_depth);
+            snapshot, current_depth, current_scene_depth);
         if (sample_log_count < 24 &&
             ((particle->spawn_order & 7u) == 0u) &&
             sample->age >= 0.10f) {
@@ -8021,7 +8517,7 @@ static void liquid_apply_depth_collisions(
                     &midpoint_depth) &&
                 liquid_sample_depth_float(snapshot, mapped, midpoint_x,
                                           midpoint_y, &scene_depth) &&
-                liquid_depth_is_behind(midpoint_depth, scene_depth))
+                liquid_depth_is_behind(snapshot, midpoint_depth, scene_depth))
                 memcpy(back, midpoint, sizeof(back));
             else
                 memcpy(front, midpoint, sizeof(front));
@@ -8075,7 +8571,6 @@ static void liquid_apply_depth_collisions(
             particle->has_last_visible = 1;
             memcpy(particle->impact_velocity, sample->velocity,
                    sizeof(particle->impact_velocity));
-            liquid_queue_native_model_contact(particle);
         }
         memset(particle->velocity, 0, sizeof(particle->velocity));
         particle->collided = 1;
@@ -8092,6 +8587,9 @@ static void liquid_apply_depth_collisions(
             particle->lifetime = particle->age + cfg.collision_surface_hold;
         if (particle->secondary) particle->lifetime = particle->age + 0.18f;
         liquid_link_contact(particle, snapshot, mapped);
+        /* Publish only after impact response has stored the surface normal;
+           room validation needs that normal as well as the collision point. */
+        liquid_queue_native_model_contact(particle);
         if (collision_log_count < 12) {
             collision_log_count++;
             log_line("liquid depth collision hit particle=%u age=%.3f world=(%.4f,%.4f,%.4f) particle_depth=%.6f scene_depth=%.6f sweep_steps=%d world_gap=%.5f",
@@ -8357,7 +8855,8 @@ static void liquid_depth_collision_tick(
            sizeof(current_snapshot.projection));
     memcpy(&current_snapshot.viewport, &captured_d3d_viewport,
            sizeof(current_snapshot.viewport));
-    memcpy(current_snapshot.camera_inverse, captured_camera_inverse,
+    memcpy(current_snapshot.camera_inverse, liquid_scene_camera_override ?
+           liquid_scene_camera_override : captured_camera_inverse,
            sizeof(current_snapshot.camera_inverse));
     min_x = (float)source_desc.Width;
     min_y = (float)source_desc.Height;
@@ -8372,7 +8871,7 @@ static void liquid_depth_collision_tick(
         float sweep_x, sweep_y, sweep_depth;
         int axis;
         if (!particle->active || particle->collided ||
-            particle->source_kind != 1 ||
+            !liquid_shared_source(particle->source_kind) ||
             !liquid_project_world_depth_snapshot(
                 &current_snapshot, particle->position, &x, &y, &depth))
             continue;
@@ -8603,7 +9102,7 @@ static float liquid_model_breakup_blend(
     float window;
     float start;
     float blend;
-    if (!particle || particle->source_kind != 1 || particle->satellite)
+    if (!particle || !liquid_shared_source(particle->source_kind) || particle->satellite)
         return 1.0f;
     window = cfg.model_stream_cohesion * 0.28f;
     if (window < 0.10f) window = 0.10f;
@@ -8691,8 +9190,9 @@ static void liquid_round_droplet_extent(float radius,
 static int liquid_model_nozzle(const liquid_emitter_t *emitter, float position[3])
 {
     if (!position || !emitter || !emitter->transform_valid ||
-        !emitter->emission_id || emitter->person_index < 1 ||
-        emitter->person_index > LIQUID_MODEL_EMITTER_COUNT) return 0;
+        !emitter->emission_id ||
+        (emitter->source_kind != 2 && (emitter->person_index < 1 ||
+        emitter->person_index > LIQUID_MODEL_EMITTER_COUNT))) return 0;
     memcpy(position, emitter->current_position, sizeof(float) * 3);
     return 1;
 }
@@ -8850,6 +9350,46 @@ static int liquid_append_capsule(
     return 1;
 }
 
+/* A landed footprint has surface depth, not the constant depth of a billboard.
+   Fit that plane in screen space; perspective device depth is linear across
+   a plane. The small outward offset avoids coplanar quantization without
+   changing collision/attachment positions or disabling scene occlusion. */
+static int liquid_contact_surface_depth(liquid_d3d11_vertex_t *vertices, UINT count,
+    const float anchor[3], const float normal[3], UINT width, UINT height,
+    const D3DMATRIX *projection, const D3DVIEWPORT8 *viewport)
+{
+    float n[3], tangent[3], bitangent[3], reference[3]={0,1,0};
+    float x[3], y[3], z[3], world[3], view_depth;
+    double determinant, a, b, c;
+    if (!count || !projection || !viewport) return 0;
+    memcpy(n,normal,sizeof(n));
+    if (!liquid_vec3_normalize(n)) return 0;
+    if (fabsf(n[1])>0.9f) { reference[0]=1; reference[1]=0; }
+    liquid_vec3_cross(n,reference,tangent);
+    if (!liquid_vec3_normalize(tangent)) return 0;
+    liquid_vec3_cross(n,tangent,bitangent);
+    for(int i=0;i<3;i++) {
+        for(int axis=0;axis<3;axis++)
+            world[axis]=anchor[axis]+n[axis]*0.0005f+
+                (i==1 ? tangent[axis]*0.02f : i==2 ? bitangent[axis]*0.02f : 0);
+        if (!liquid_project_world_d3d11(world,width,height,(float)width/height,0.414f,
+            1,projection,viewport,&x[i],&y[i],&view_depth,&z[i],NULL)) return 0;
+        x[i]=2*x[i]/width-1; y[i]=1-2*y[i]/height;
+    }
+    determinant=(double)(x[1]-x[0])*(y[2]-y[0])-(double)(x[2]-x[0])*(y[1]-y[0]);
+    if (!isfinite(determinant) || fabs(determinant)<1e-10) return 0;
+    a=((double)(z[1]-z[0])*(y[2]-y[0])-(double)(z[2]-z[0])*(y[1]-y[0]))/determinant;
+    b=((double)(x[1]-x[0])*(z[2]-z[0])-(double)(x[2]-x[0])*(z[1]-z[0]))/determinant;
+    c=z[0]-a*x[0]-b*y[0];
+    for(UINT i=0;i<count;i++) {
+        double depth=a*vertices[i].position[0]+b*vertices[i].position[1]+c;
+        if (!isfinite(depth) || depth<0 || depth>1) return 0;
+    }
+    for(UINT i=0;i<count;i++)
+        vertices[i].position[2]=(float)(a*vertices[i].position[0]+b*vertices[i].position[1]+c);
+    return 1;
+}
+
 static void liquid_append_contact_connections(liquid_d3d11_vertex_t *vertices,
     UINT *vertex_count, UINT width, UINT height, float aspect, float tan_half_fov,
     int exact_projection, const D3DMATRIX *projection, const D3DVIEWPORT8 *viewport,
@@ -8894,8 +9434,20 @@ static void liquid_append_contact_connections(liquid_d3d11_vertex_t *vertices,
                 radius_a + (radius_b - radius_a) * t, 1.18f) * neck;
             points[j].alpha = alpha;
         }
-        if (j == 5) liquid_append_smooth_ribbon(vertices, vertex_count, points, 5,
-                                               (float)width, (float)height);
+        if (j == 5) {
+            UINT first=*vertex_count;
+            liquid_append_smooth_ribbon(vertices, vertex_count, points, 5,
+                                       (float)width, (float)height);
+            if (exact_projection) for(UINT section=0;first+section*6+6<=*vertex_count;section++) {
+                float t=(section+0.5f)*0.25f, anchor[3], normal[3];
+                for(axis=0;axis<3;axis++) {
+                    anchor[axis]=a->position[axis]+(b->position[axis]-a->position[axis])*t;
+                    normal[axis]=a->contact_normal[axis]+(b->contact_normal[axis]-a->contact_normal[axis])*t;
+                }
+                liquid_contact_surface_depth(vertices+first+section*6,6,anchor,normal,
+                                             width,height,projection,viewport);
+            }
+        }
     }
 }
 
@@ -9063,7 +9615,7 @@ static void liquid_draw_particles_d3d11_target_bounds(
     memset(ribbon_participating, 0, sizeof(ribbon_participating));
     memset(ribbon_occluded, 0, sizeof(ribbon_occluded));
     memset(droplet_blend, 0, sizeof(droplet_blend));
-    /* Build one smooth ribbon for every coherent model pulse.  The actual
+    /* Build one smooth ribbon for every coherent model or POV pulse.  The actual
        particles remain the physical control points, so gravity bends the
        stream naturally while Catmull-Rom interpolation removes the old
        segmented-droplet appearance. */
@@ -9078,12 +9630,12 @@ static void liquid_draw_particles_d3d11_target_bounds(
         int smooth_count = 0;
         int group_nozzle_valid = 0;
         int j, k;
-        if (processed[i] || !seed->active || seed->source_kind != 1 ||
+        if (processed[i] || !seed->active || !liquid_shared_source(seed->source_kind) ||
             seed->satellite || seed->age > cfg.model_stream_cohesion)
             continue;
         for (j = 0; j < cfg.particle_limit; j++) {
             liquid_particle_t *candidate = &liquid_particles[j];
-            if (!candidate->active || candidate->source_kind != 1 ||
+            if (!candidate->active || !liquid_shared_source(candidate->source_kind) ||
                 candidate->satellite ||
                 (!candidate->collided &&
                  candidate->age > cfg.model_stream_cohesion) ||
@@ -9345,6 +9897,9 @@ static void liquid_draw_particles_d3d11_target_bounds(
         if (!particle->active || ribbon_rendered[i] ||
             ribbon_occluded[i]) continue;
         if (particle->collided) {
+            if (InterlockedCompareExchange(&particle->room_contact_verified, 0, 0))
+                particle->contact_physx_person = -1;
+            UINT contact_first=vertex_count;
             float impact_world[3];
             float impact_x, impact_y, impact_depth, impact_screen_depth;
             float direction_x, direction_y, direction_length;
@@ -9412,6 +9967,10 @@ static void liquid_draw_particles_d3d11_target_bounds(
                 screen_y + direction_y * half_width * sqrtf(impact_aspect),
                 screen_depth, half_width / sqrtf(impact_aspect),
                 alpha, (float)width, (float)height, 0.0f);
+            if (exact_projection_available && particle->contact_normal_valid)
+                liquid_contact_surface_depth(vertices+contact_first,vertex_count-contact_first,
+                    particle->position,particle->contact_normal,width,height,
+                    &frame_projection,&frame_viewport);
             continue;
         }
         rounding = liquid_droplet_rounding(particle);
@@ -9663,7 +10222,7 @@ static void __cdecl liquid_hook5_d3d8_present_capture_callback(
     }
 }
 
-static void liquid_capture_hook5_projection(unsigned int width,
+static int liquid_capture_hook5_projection(unsigned int width,
                                             unsigned int height)
 {
     D3DMATRIX projection;
@@ -9671,7 +10230,7 @@ static void liquid_capture_hook5_projection(unsigned int width,
     static int capture_logged;
     if (!hook5_get_projection_matrix || !width || !height ||
         !hook5_get_projection_matrix(1u, (float *)&projection))
-        return;
+        return 0;
     memset(&viewport, 0, sizeof(viewport));
     viewport.Width = width;
     viewport.Height = height;
@@ -9687,6 +10246,53 @@ static void liquid_capture_hook5_projection(unsigned int width,
                  width, height, projection._11, projection._22,
                  projection._33, projection._34);
     }
+    return 1;
+}
+
+/* AppTracker's inverse and Hook5's scene view need not be updated together.
+   Convert only rigid affine views: the projection helpers assume unit axes. */
+static int liquid_camera_inverse_from_view(const float view[16], float inverse[16])
+{
+    float result[16] = {0};
+    if (!view || !inverse) return 0;
+    for (int i = 0; i < 16; ++i) if (!_finite(view[i])) return 0;
+    if (fabsf(view[3]) > 0.0001f || fabsf(view[7]) > 0.0001f ||
+        fabsf(view[11]) > 0.0001f || fabsf(view[15] - 1) > 0.0001f) return 0;
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) {
+        float dot = 0;
+        for (int k = 0; k < 3; ++k) dot += view[i*4+k] * view[j*4+k];
+        if (fabsf(dot - (i == j ? 1.0f : 0.0f)) > 0.002f) return 0;
+        result[i*4+j] = view[j*4+i];
+    }
+    for (int j = 0; j < 3; ++j)
+        for (int k = 0; k < 3; ++k)
+            result[12+j] -= view[12+k] * result[k*4+j];
+    result[15] = 1;
+    memcpy(inverse, result, sizeof(result));
+    return 1;
+}
+
+static void liquid_capture_hook5_scene_camera(ID3D11DepthStencilView *depth_view)
+{
+    float view[16];
+    static int capture_logged;
+    liquid_hook5_scene_camera_valid = 0;
+    liquid_hook5_scene_camera_depth = NULL;
+    if (!depth_view || !hook5_get_view_matrix ||
+        !hook5_get_view_matrix(1u, view) ||
+        !liquid_camera_inverse_from_view(view, liquid_hook5_scene_camera_inverse)) return;
+    liquid_hook5_scene_camera_depth = depth_view;
+    liquid_hook5_scene_camera_valid = 1;
+    if (!capture_logged) {
+        capture_logged = 1;
+        log_line("liquid Hook5 scene camera synchronization active depth=%p", depth_view);
+    }
+}
+
+static const float *liquid_hook5_camera_for_depth(ID3D11DepthStencilView *depth_view)
+{
+    return liquid_hook5_scene_camera_valid && depth_view &&
+        depth_view == liquid_hook5_scene_camera_depth ? liquid_hook5_scene_camera_inverse : NULL;
 }
 
 static void __cdecl liquid_hook5_present_callback(IDXGISwapChain *swap_chain)
@@ -9694,6 +10300,8 @@ static void __cdecl liquid_hook5_present_callback(IDXGISwapChain *swap_chain)
     static int callback_logged;
     LONG scene_drawn;
     LONG composite_drawn;
+    liquid_hook5_scene_camera_valid = 0;
+    liquid_hook5_scene_camera_depth = NULL;
     InterlockedExchange(&hook5_frame_seen, 1);
     InterlockedExchange(&liquid_renderer_tick, (LONG)GetTickCount());
     if (!callback_logged) {
@@ -9735,8 +10343,16 @@ static void __cdecl liquid_hook5_composite_callback(
     unsigned int height)
 {
     static int callback_logged;
+    const float *previous_camera;
     InterlockedExchange(&hook5_frame_seen, 1);
-    liquid_capture_hook5_projection(width, height);
+    if (liquid_capture_hook5_projection(width, height)) {
+        float fov = 0;
+        liquid_tool_composite_projection = captured_d3d_projection;
+        if (!hook5_get_fov_multiplier || !hook5_get_fov_multiplier(1u, &fov) ||
+            !_finite(fov) || fov < 0.05f || fov > 8) fov = 0;
+        liquid_tool_composite_fov = fov;
+        liquid_tool_composite_projection_tick = GetTickCount();
+    }
     if (!callback_logged) {
         callback_logged = 1;
         log_line("liquid Hook5 post-lighting D3D11 composition active context=%p target=%p retained_depth=%p viewport=%ux%u",
@@ -9744,8 +10360,11 @@ static void __cdecl liquid_hook5_composite_callback(
     }
     InterlockedExchange(&hook5_composite_drawn_since_present, 1);
     if (!liquid_runtime_work_active(GetTickCount())) return;
+    previous_camera = liquid_scene_camera_override;
+    liquid_scene_camera_override = liquid_hook5_camera_for_depth(depth_view);
     liquid_draw_particles_d3d11_target(
         NULL, context, render_target, depth_view, width, height);
+    liquid_scene_camera_override = previous_camera;
 }
 
 static void __cdecl liquid_hook5_scene_callback(
@@ -9758,6 +10377,9 @@ static void __cdecl liquid_hook5_scene_callback(
     D3DVIEWPORT8 captured_viewport;
     int captured_valid;
     int target_matches_camera = 1;
+    const float *previous_camera;
+    liquid_hook5_scene_camera_valid = 0;
+    liquid_hook5_scene_camera_depth = NULL;
     InterlockedExchange(&hook5_frame_seen, 1);
     liquid_capture_hook5_projection(width, height);
     captured_valid = InterlockedCompareExchange(
@@ -9795,11 +10417,14 @@ static void __cdecl liquid_hook5_scene_callback(
     }
     InterlockedExchange(&hook5_scene_tick, (LONG)GetTickCount());
     InterlockedExchange(&liquid_renderer_tick, (LONG)GetTickCount());
+    liquid_capture_hook5_scene_camera(depth_view);
     liquid_simulation_tick();
     /* This was the valid camera-sized scene even when no liquid exists.
        Mark it consumed so Present does not repeat the idle simulation. */
     InterlockedExchange(&hook5_scene_drawn_since_present, 1);
     if (!liquid_runtime_work_active(GetTickCount())) return;
+    previous_camera = liquid_scene_camera_override;
+    liquid_scene_camera_override = liquid_hook5_camera_for_depth(depth_view);
     liquid_probe_d3d11_collision_depth(depth_view);
     liquid_depth_collision_tick(context, depth_view);
     /* When Hook5 Extended exposes its verified post-lighting callback, this
@@ -9810,6 +10435,7 @@ static void __cdecl liquid_hook5_scene_callback(
             &hook5_d3d11_composite_registered, 0, 0))
         liquid_draw_particles_d3d11_target(
             NULL, context, render_target, depth_view, width, height);
+    liquid_scene_camera_override = previous_camera;
 }
 
 static int liquid_try_register_hook5_present_callback(void)
@@ -9828,6 +10454,10 @@ static int liquid_try_register_hook5_present_callback(void)
         GetProcAddress(hook5_extended,
             "nc_hook5_extended_get_projection_matrix"),
         sizeof(hook5_get_projection_matrix));
+    copy_proc_address(
+        &hook5_get_view_matrix,
+        GetProcAddress(hook5_extended, "nc_hook5_extended_get_view_matrix"),
+        sizeof(hook5_get_view_matrix));
     copy_proc_address(
         &hook5_register_present_callback,
         GetProcAddress(hook5_extended,
@@ -10270,6 +10900,10 @@ static DWORD __cdecl hook_AppMain_Command(void *command_args)
             interesting = liquid_text(command);
             if (_stricmp(command, "CumShot") == 0)
                 liquid_note_tool_command(GetTickCount());
+            else if (_stricmp(command, "CleanUp") == 0) {
+                liquid_room_clear_pending();
+                liquid_pov_cancel();
+            }
             if ((interesting || cfg.log_all_commands) && reserve_event()) {
                 static const char *fields[] = {
                     "Cmd", "SubCmd", "Action", "Situation", "Person",
@@ -10327,7 +10961,7 @@ static void THISCALL hook_Object_iNameSet(void *self, const void *member,
         int changed;
         /* Mesh children are named before their PersonXXSpermray or
            Tool01Spermray owner. Hide provisionally, then restore the same
-           freshly created nodes when the owner is identified as the tool. */
+           freshly created nodes for the tool unless POV liquids are enabled. */
         liquid_remember_recent_native_ray_node(self);
         changed = liquid_set_script_visibility(self, 0u);
         if (cfg.enabled && reserve_event())
@@ -10339,7 +10973,7 @@ static void THISCALL hook_Object_iNameSet(void *self, const void *member,
          _stricmp(copy, "STool01Spermray") == 0)) {
         int changed = liquid_classify_recent_native_ray_nodes(1);
         if (cfg.enabled && reserve_event())
-            log_line("liquid native ray owner classified source=tool owner=\"%s\" restored_nodes=%d",
+            log_line("liquid native ray owner classified source=tool owner=\"%s\" changed_nodes=%d",
                      copy, changed);
     } else if (cfg.liquids_enabled && copy[0] &&
                (liquid_person_spermray_root_name(copy) ||
@@ -10713,6 +11347,9 @@ static void liquid_native_begin_frozen_capture(void *descriptor)
 
 /* Called only after submitting a custom liquid ray. Keep native decal
    creation and exact particle-to-body confirmation as separate outcomes. */
+#include "liquid_contact_perf.c"
+#include "liquid_room_decals.c"
+
 static int liquid_native_track_custom_stain_pick(
     void *descriptor, const liquid_native_contact_t *contact,
     int native_result, void *results)
@@ -10750,7 +11387,7 @@ static int liquid_native_track_custom_stain_pick(
        every hit used to bypass the 100 ms diagnostic throttle. */
     InterlockedExchange(&liquid_native_animation_diag_until_tick,
                         (LONG)(GetTickCount() + 2500u));
-    return body_confirmed;
+    return body_confirmed || (contact->target_kind == 1 && attachment_outcome == LIQUID_ATTACHMENT_ROOM);
 }
 
 static int liquid_native_retry_stain_miss(
@@ -11116,9 +11753,11 @@ static liquid_emitter_t *liquid_emitter_for_native_update(
     int offset;
     int start_index = (int)InterlockedCompareExchange(
         &next_emitter_index, 0, 0);
-    for (offset = 0; offset < LIQUID_MODEL_EMITTER_COUNT; offset++) {
-        int index = (start_index + offset) % LIQUID_MODEL_EMITTER_COUNT;
-        liquid_emitter_t *emitter = &model_emitters[index];
+    for (offset = 0; offset < (LIQUID_MODEL_EMITTER_COUNT + 1); offset++) {
+        int index = (start_index + offset) % (LIQUID_MODEL_EMITTER_COUNT + 1);
+        liquid_emitter_t *emitter = index == LIQUID_MODEL_EMITTER_COUNT ?
+            &tool_emitter : &model_emitters[index];
+        if (index == LIQUID_MODEL_EMITTER_COUNT && !cfg.pov_enabled) continue;
         void *descriptor = emitter->native_stain_descriptor;
         if (!emitter->emission_id || !descriptor ||
             !liquid_native_model_contact_pending(emitter->emission_id, now))
@@ -11126,7 +11765,7 @@ static liquid_emitter_t *liquid_emitter_for_native_update(
         if (liquid_native_descriptor_in_update(update, descriptor)) {
             InterlockedExchange(
                 &next_emitter_index,
-                (LONG)((index + 1) % LIQUID_MODEL_EMITTER_COUNT));
+                (LONG)((index + 1) % (LIQUID_MODEL_EMITTER_COUNT + 1)));
             return emitter;
         }
     }
@@ -11136,7 +11775,8 @@ static liquid_emitter_t *liquid_emitter_for_native_update(
 /* One summary per second, rather than one timing log per control or hit. */
 static void liquid_native_update_perf(DWORD now, LARGE_INTEGER start,
                                       LARGE_INTEGER native_end,
-                                      LARGE_INTEGER freeze_end)
+                                      LARGE_INTEGER freeze_end,
+                                      const liquid_native_freeze_capture_t *capture)
 {
     static LARGE_INTEGER frequency;
     static DWORD last;
@@ -11148,6 +11788,7 @@ static void liquid_native_update_perf(DWORD now, LARGE_INTEGER start,
     if (!frequency.QuadPart) return;
     QueryPerformanceCounter(&end);
     scale = 1000.0 / (double)frequency.QuadPart;
+    liquid_contact_slow_report(now, capture, native_end.QuadPart-start.QuadPart, scale);
     native_ms += (native_end.QuadPart - start.QuadPart) * scale;
     freeze_ms += (freeze_end.QuadPart - native_end.QuadPart) * scale;
     diagnostics_ms += (end.QuadPart - freeze_end.QuadPart) * scale;
@@ -11199,10 +11840,16 @@ static void liquid_report_renderer_health(DWORD now)
     }
 }
 
+#include "liquid_pov_lifecycle.c"
+#include "liquid_pov_ui.c"
+
 static void THISCALL hook_NativeStainUpdate(
     void *self, void *update_context, void *receiver, void *result_state)
 {
     DWORD now = GetTickCount();
+    liquid_capture_tool_crosshair(self, update_context, now);
+    liquid_bind_tool_descriptor(self, update_context);
+    liquid_pov_cursor_tick();
     liquid_report_renderer_health(now);
     int measure = cfg.enabled;
     LARGE_INTEGER perf_start = {0}, perf_native_end = {0}, perf_freeze_end = {0};
@@ -11224,7 +11871,7 @@ static void THISCALL hook_NativeStainUpdate(
     if (!capture.freeze_generation)
         capture.freeze_generation = ++liquid_native_freeze_generation;
     liquid_native_freeze_capture = &capture;
-    if (cfg.liquids_enabled && cfg.collision_spawn_model_stains &&
+    if (cfg.liquids_enabled && (cfg.collision_spawn_model_stains || cfg.collision_spawn_room_stains) &&
         emission_id && descriptor_emission == (LONG)emission_id &&
         liquid_native_model_contact_pending(emission_id, now) &&
         descriptor && liquid_native_descriptor_in_update(self, descriptor) &&
@@ -11233,7 +11880,7 @@ static void THISCALL hook_NativeStainUpdate(
         ptr_writable((BYTE*)descriptor + 0x18, sizeof(double))) {
         LONG state = *(volatile LONG*)((BYTE*)descriptor + 0x10);
         float rate = *(const float*)((const BYTE*)descriptor + 0x20);
-        if ((state == 0 || state == 1) && _finite(rate) &&
+        if ((state == 0 || state == 1 || model_emitter == &tool_emitter) && _finite(rate) &&
             rate > 0.0001f && rate < 10000.0f && engine_TimerSetSeconds) {
             double trigger_seconds = 0.4 / (double)rate + 0.001;
             engine_TimerSetSeconds((BYTE*)descriptor + 0x18,
@@ -11258,6 +11905,7 @@ static void THISCALL hook_NativeStainUpdate(
     if (tramp_NativeStainUpdate)
         tramp_NativeStainUpdate(self, update_context, receiver,
                                 result_state);
+    liquid_room_stain_creation_report(&capture);
     if (measure) QueryPerformanceCounter(&perf_native_end);
     liquid_native_finish_frozen_capture();
     liquid_native_hold_custom_stain_weights(self);
@@ -11266,7 +11914,7 @@ static void THISCALL hook_NativeStainUpdate(
     if (cfg.enabled)
         liquid_native_animation_diag_sample(self);
     liquid_apply_testicular_retraction_weights();
-    if (measure) liquid_native_update_perf(now, perf_start, perf_native_end, perf_freeze_end);
+    if (measure) liquid_native_update_perf(now, perf_start, perf_native_end, perf_freeze_end, &capture);
 }
 
 /* Observe TK17's own ray-hit path without changing its result.  The native
@@ -11301,6 +11949,7 @@ static void liquid_verify_recent_body_contacts(
         int pick_result;
         if (!p->active || !p->collided || p->emission_id != emission_id ||
             p->contact_physx_person != 0 || p->contact_person ||
+            InterlockedCompareExchange(&p->room_contact_verified, 0, 0) ||
             InterlockedCompareExchange(&p->model_contact_verified, 0, 0) ||
             p->collision_age > 0.25f || p->model_contact_probe_count >= 3 ||
             (p->model_contact_probe_count && now - p->model_contact_probe_tick < 16)) continue;
@@ -11320,7 +11969,7 @@ static void liquid_verify_recent_body_contacts(
         /* The camera ray samples the visible model at the depth impact's
            exact pixel. No lateral retry offsets and no neighborhood inference. */
         if (!liquid_native_contact_camera_ray(&contact, origin, direction)) continue;
-        pick_result = tramp_AppPick_PickRay(self, geometry_list_ref, origin, direction,
+        pick_result = liquid_measured_pick(0, self, geometry_list_ref, origin, direction,
                                           results, include_hidden, flags);
         if (cfg.enabled) liquid_native_probe_calls++;
         if (pick_result < 0 || !liquid_native_pick_result_data(results, &data, &count) ||
@@ -11386,6 +12035,9 @@ static int THISCALL hook_AppPick_PickRay(
                 }
             }
         }
+        if (!model_emitter && cfg.pov_enabled && tool_emitter.emission_id &&
+            tool_emitter.native_stain_descriptor == native_descriptor)
+            model_emitter = &tool_emitter;
         if (!model_emitter) model_emitter = liquid_latest_model_emitter();
         if (native_descriptor &&
             model_emitter &&
@@ -11434,7 +12086,7 @@ static int THISCALL hook_AppPick_PickRay(
         liquid_verify_recent_body_contacts(self, geometry_list_ref, results,
             include_hidden, flags, model_emitter->emission_id, now);
     if (tramp_AppPick_PickRay && cfg.liquids_enabled &&
-        cfg.collision_spawn_model_stains && model_emitter &&
+        (cfg.collision_spawn_model_stains || cfg.collision_spawn_room_stains) && model_emitter &&
         model_emitter->emission_id &&
         now <= model_emitter->end_tick + LIQUID_NATIVE_CONTACT_MAX_AGE_MS &&
         native_stain_caller) {
@@ -11459,7 +12111,8 @@ static int THISCALL hook_AppPick_PickRay(
                 liquid_native_replace_caller_ray(
                     origin, direction, custom_origin, custom_direction)) {
                 used_custom_contact = 1;
-                result = tramp_AppPick_PickRay(
+                if (contact.target_kind != 1 && cfg.collision_spawn_model_stains)
+                    result = liquid_measured_pick(0, 
                     self, geometry_list_ref, origin, direction,
                     results, include_hidden, flags);
             } else {
@@ -11467,7 +12120,8 @@ static int THISCALL hook_AppPick_PickRay(
                          custom_particle_id, contact.emission_id);
             }
             liquid_native_pick_result_data(results, &data, &count);
-            if (used_custom_contact && (result < 0 || count <= 0) &&
+            if (used_custom_contact && contact.target_kind != 1 && cfg.collision_spawn_model_stains &&
+                (result < 0 || count <= 0) &&
                 liquid_native_contact_camera_ray(
                     &contact, custom_origin, custom_direction)) {
                 data = NULL;
@@ -11478,7 +12132,7 @@ static int THISCALL hook_AppPick_PickRay(
                     liquid_native_replace_caller_ray(
                         origin, direction, custom_origin,
                         custom_direction)) {
-                    result = tramp_AppPick_PickRay(
+                    result = liquid_measured_pick(0, 
                         self, geometry_list_ref, origin, direction,
                         results, include_hidden, flags);
                     liquid_native_pick_result_data(results, &data, &count);
@@ -11486,6 +12140,10 @@ static int THISCALL hook_AppPick_PickRay(
             }
             custom_contact_hit = 0;
             if (used_custom_contact) {
+                result = liquid_try_room_stain_pick(self, &contact, native_frame,
+                    origin, direction, results, flags, result);
+                data = NULL; count = 0;
+                liquid_native_pick_result_data(results, &data, &count);
                 if (result >= 0 && count > 0)
                     liquid_native_stage_surface_projector(native_frame, data);
                 custom_contact_hit = liquid_native_track_custom_stain_pick(
@@ -11533,7 +12191,7 @@ static int THISCALL hook_AppPick_PickRay(
             }
             if (trace_contact) {
                 liquid_native_freeze_capture_t *capture = liquid_native_freeze_capture;
-                log_line("liquid native stain contact consumed source=confirmed particle=%u emission=%u retry=%u result=%d count=%d native_hit=%d body_confirmed=%d retried=%d attachment_basis=%s outcome=%s",
+                log_line("liquid native stain contact consumed source=confirmed particle=%u emission=%u retry=%u result=%d count=%d native_hit=%d contact_confirmed=%d retried=%d attachment_basis=%s outcome=%s",
                          custom_particle_id, contact.emission_id,
                          contact.retry_count, result, count,
                          used_custom_contact && result >= 0 && count > 0,
@@ -11559,7 +12217,7 @@ static int THISCALL hook_AppPick_PickRay(
            queued custom contact. A confirmed contact that misses the model
            geometry must remain a miss; retrying TK17's unrelated old ray can
            place a decal before or away from the custom droplet. */
-        result = tramp_AppPick_PickRay(
+        result = liquid_measured_pick(0, 
             self, geometry_list_ref, origin, direction, results,
             include_hidden, flags);
     }
@@ -11606,6 +12264,8 @@ static int THISCALL hook_AppPick_PickRay(
     return result;
 }
 
+#include "liquid_pov_contacts.c"
+
 static void install_hooks(void)
 {
     static const BYTE app_expected[5] = {0x55, 0x8b, 0xec, 0x53, 0x56};
@@ -11625,6 +12285,20 @@ static void install_hooks(void)
     patch_liquid_config_editor_hooks();
     if (!cfg.enabled && !cfg.liquids_enabled) return;
     resolve_engine_symbols();
+    if (cfg.collision_spawn_room_stains) {
+        memcpy(&liquid_room_string_construct, (BYTE*)exe + ENGINE_STRING_CSTR_CONSTRUCT_RVA,
+               sizeof(liquid_room_string_construct));
+        memcpy(&liquid_room_string_release, (BYTE*)exe + ENGINE_STRING_RELEASE_RVA,
+               sizeof(liquid_room_string_release));
+        if (!ptr_executable((void*)liquid_room_string_construct) ||
+            !ptr_executable((void*)liquid_room_string_release)) {
+            liquid_room_string_construct = NULL;
+            liquid_room_string_release = NULL;
+        }
+        liquid_room_install_triangle_hooks((BYTE*)exe);
+        liquid_room_install_clip_hook((BYTE*)exe, sys);
+    }
+    liquid_install_pov_hooks(exe, app);
 
     if (!camera_hook_ready) {
         target = (BYTE*)GetProcAddress(
@@ -11699,7 +12373,7 @@ static void install_hooks(void)
         }
     }
 
-    if (cfg.liquids_enabled && cfg.collision_spawn_model_stains &&
+    if (cfg.liquids_enabled && (cfg.collision_spawn_model_stains || cfg.collision_spawn_room_stains) &&
         !native_stain_weight_hook_installed) {
         static const BYTE expected[] = {0x8b, 0x40, 0x44, 0xff, 0xd0};
         target = (BYTE*)exe + LIQUID_NATIVE_STAIN_WEIGHT_RVA;
@@ -11715,7 +12389,7 @@ static void install_hooks(void)
         }
     }
 
-    if (cfg.liquids_enabled && cfg.collision_spawn_model_stains &&
+    if (cfg.liquids_enabled && (cfg.collision_spawn_model_stains || cfg.collision_spawn_room_stains) &&
         !native_stain_projector_hook_installed) {
         static const BYTE expected[] = {0xd9, 0x85, 0x7c, 0xff, 0xff, 0xff};
         target = (BYTE*)exe + LIQUID_NATIVE_STAIN_PROJECTOR_RVA;
@@ -11732,11 +12406,11 @@ static void install_hooks(void)
     }
 
     if (cfg.liquids_enabled &&
-        (cfg.collision_spawn_model_stains ||
+        (cfg.pov_enabled || cfg.collision_spawn_model_stains || cfg.collision_spawn_room_stains ||
          cfg.collision_follow_bodies) &&
         !native_stain_update_hook_installed) {
         target = (BYTE*)exe + LIQUID_NATIVE_STAIN_UPDATE_RVA;
-        if ((!cfg.collision_spawn_model_stains || engine_TimerSetSeconds) &&
+        if ((!(cfg.collision_spawn_model_stains || cfg.collision_spawn_room_stains) || engine_TimerSetSeconds) &&
             ptr_executable(target) &&
             (target[0] == 0xe9 ||
              memcmp(target, native_stain_update_expected,
@@ -11756,7 +12430,7 @@ static void install_hooks(void)
         }
     }
 
-    if (cfg.liquids_enabled && cfg.collision_spawn_model_stains &&
+    if (cfg.liquids_enabled && (cfg.pov_enabled || cfg.collision_spawn_model_stains || cfg.collision_spawn_room_stains) &&
         !app_pick_ray_hook_installed) {
         target = (BYTE*)GetProcAddress(
             app,
@@ -11893,10 +12567,10 @@ static DWORD WINAPI startup_worker(void *unused)
             install_hooks();
             if (app_command_hook_installed && object_name_hook_installed &&
                 engine_GetModelViewRotationPivot && (graphics_hook_ready || hook5_present_registered)) {
-                log_line("liquid hooks initialized command_hook=1 object_name_hook=1 camera_hook=%ld graphics_device_hook=%ld enabled=%d model_duration=%.3f tool_duration=%.3f particle_limit=%d renderer_activation=await-frame",
+                log_line("liquid hooks initialized command_hook=1 object_name_hook=1 camera_hook=%ld graphics_device_hook=%ld enabled=%d model_duration=%.3f tool_pulse_duration=%.3f particle_limit=%d renderer_activation=await-frame",
                          camera_hook_ready, graphics_hook_ready,
                          cfg.liquids_enabled, cfg.model_duration,
-                         cfg.tool_duration, cfg.particle_limit);
+                         liquid_tool_pulse_duration(), cfg.particle_limit);
                 return 0;
             }
         }
